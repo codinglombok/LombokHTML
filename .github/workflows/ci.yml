@@ -1,0 +1,12 @@
+# Salin ke <Repo>/.github/workflows/ci.yml  (ganti LombokHTML & lombokhtml)
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  lombok-ci:
+    uses: codinglombok/.github/.github/workflows/lombok-ci.yml@main
+    with:
+      repo_name: LombokHTML
+      package_name: lombokhtml

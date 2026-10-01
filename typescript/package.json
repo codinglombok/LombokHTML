@@ -1,0 +1,45 @@
+{
+  "name": "lombokhtml",
+  "version": "0.1.0",
+  "description": "Zero-dependency HTML ingestion: tolerant parser, DOM, entity decoding, allowlist sanitizer, selectors, meta and table extraction. Byte-identical with the Rust reference.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "html",
+    "parser",
+    "sanitizer",
+    "xss",
+    "dom",
+    "selector",
+    "scraping"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codinglombok/LombokHTML.git",
+    "directory": "typescript"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/vectors.test.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}
