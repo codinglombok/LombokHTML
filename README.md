@@ -4,7 +4,7 @@ HTML ingestion: tolerant parser and DOM, entity decoding, text extraction, an al
 
 A standalone, general-purpose library of the **Lombok Ecosystem** — Tier **L0**. No mandatory dependency on any other Lombok library (L0).
 
-> **Universal by design.** Usable by anyone — from small embedded devices to premium industrial software — without any application or framework. It is not part of, and not owned by, any app or server (e.g. RAG stacks); apps are merely example users. See [`docs/masterplan_LombokHTML_v0.1.0.md`](docs/masterplan_LombokHTML_v0.1.0.md) §2 for the U1–U12 evidence table (honest ✅/🟡/⚪ status).
+> **Universal by design.** Usable by anyone — from small embedded devices to premium industrial software — without any application or framework. It is not part of, and not owned by, any app or server (e.g. RAG stacks); apps are merely example users.
 
 ## Status
 
@@ -59,9 +59,6 @@ LOMBOK_REGEN=1 cargo test --release --test vectors    # regenerate expected outp
 
 Vector inputs are authored in `vectors/gen_inputs.py` (deterministic); expected outputs come from the Rust reference and are reviewed by hand and, where possible, by independent checks. Changing any vector requires updating its SHA-256 in `docs/SPEC_LombokHTML_v0.1.0.md` (CI enforces it).
 
-## Documentation (12 standard documents)
-
-All in [`docs/`](docs/): masterplan · architecture · changelog · map · structure_repo · full_summary_project · guide_how_to_use · how_to_dist · development_ide · **API** · **Lang** · **SPEC** (normative contract). Distribution to GitHub & registries: [`how_to_dist`](docs/how_to_dist_LombokHTML_v0.1.0.md).
 
 ## License
 
