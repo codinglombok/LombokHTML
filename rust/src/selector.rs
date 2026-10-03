@@ -1,346 +1,532 @@
-//! CSS selector query: compound selectors (`tag`, `*`, `.class`, `#id`,
-//! `[attr]`, `[attr=v]`, `[attr^=v]`, `[attr$=v]`, `[attr*=v]`, `[attr~=v]`),
-//! the descendant (` `) and child (`>`) combinators, and comma-separated
-//! selector lists. No sibling combinators or pseudo-classes (documented).
-//!
-//! Matching is relative to the queried subtree: ancestors above the query
-//! root are not considered.
+//! CSS selector subset (SPEC section 8).
 
-use crate::dom::{Node, NodeKind};
+use crate::dom::{Document, NodeId, NodeKind};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum AttrOp {
-    Exists,
-    Equals,
-    Prefix,
-    Suffix,
-    Contains,
-    Word,
+/// A selector that does not follow the SPEC grammar. `offset` counts
+/// characters from the start of the selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectorError {
+    pub offset: usize,
 }
 
-/// One compound selector, e.g. `div.card#main[data-x=1]`.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Selector {
-    pub tag: Option<String>,
-    pub id: Option<String>,
-    pub classes: Vec<String>,
-    pub attrs: Vec<(String, AttrOp, String)>,
+impl SelectorError {
+    /// The error code shared by every port.
+    pub fn code(&self) -> &'static str {
+        "BAD_SELECTOR"
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Combinator {
-    Descendant,
-    Child,
+impl fmt::Display for SelectorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "BAD_SELECTOR at character {}", self.offset)
+    }
 }
 
-/// A complex selector: compounds joined by combinators (`a > b c`).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Complex {
-    /// `parts[0].0` is ignored (leading compound has no combinator).
-    pub parts: Vec<(Combinator, Selector)>,
+#[cfg(feature = "std")]
+impl std::error::Error for SelectorError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Simple {
+    Id(String),
+    Class(String),
+    Attr(String, Option<(String, String)>),
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    Empty,
+    NthChild(i64, i64),
+    NthLastChild(i64, i64),
+    Not(Box<Compound>),
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Compound {
+    tag: Option<String>,
+    simple: Vec<Simple>,
+}
+
+type Complex = Vec<(char, Compound)>;
 
 fn is_ident(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || !c.is_ascii()
 }
 
-/// Parse a single compound selector (no combinators).
-pub fn parse_selector(sel: &str) -> Selector {
-    let mut s = Selector::default();
-    let chars: Vec<char> = sel.trim().chars().collect();
-    let mut i = 0;
-    let start = i;
-    if chars.first() == Some(&'*') {
-        i += 1;
-    } else {
-        while i < chars.len() && is_ident(chars[i]) {
-            i += 1;
+fn is_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+}
+
+struct Parser {
+    s: Vec<char>,
+    i: usize,
+}
+
+type R<T> = Result<T, SelectorError>;
+
+impl Parser {
+    fn fail<T>(&self) -> R<T> {
+        Err(SelectorError { offset: self.i })
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.s.get(self.i).copied()
+    }
+
+    fn ws(&mut self) -> bool {
+        let start = self.i;
+        while self.peek().is_some_and(is_ws) {
+            self.i += 1;
         }
-        if i > start {
-            s.tag = Some(
-                chars[start..i]
-                    .iter()
-                    .collect::<String>()
-                    .to_ascii_lowercase(),
-            );
+        self.i > start
+    }
+
+    fn ident(&mut self) -> R<String> {
+        let start = self.i;
+        while self.peek().is_some_and(is_ident) {
+            self.i += 1;
+        }
+        if self.i == start {
+            return self.fail();
+        }
+        Ok(self.s[start..self.i].iter().collect())
+    }
+
+    fn list(&mut self) -> R<Vec<Complex>> {
+        let mut out = Vec::new();
+        loop {
+            self.ws();
+            out.push(self.complex()?);
+            self.ws();
+            match self.peek() {
+                None => return Ok(out),
+                Some(',') => self.i += 1,
+                Some(_) => return self.fail(),
+            }
         }
     }
-    while i < chars.len() {
-        match chars[i] {
-            '#' | '.' => {
-                let kind = chars[i];
-                i += 1;
-                let st = i;
-                while i < chars.len() && is_ident(chars[i]) {
-                    i += 1;
+
+    fn complex(&mut self) -> R<Complex> {
+        let mut parts = alloc::vec![('\0', self.compound()?)];
+        loop {
+            let save = self.i;
+            let had_ws = self.ws();
+            match self.peek() {
+                None | Some(',') => {
+                    self.i = save;
+                    return Ok(parts);
                 }
-                let name: String = chars[st..i].iter().collect();
-                if kind == '#' {
-                    s.id = Some(name);
-                } else {
-                    s.classes.push(name);
+                Some(c @ ('>' | '+' | '~')) => {
+                    self.i += 1;
+                    self.ws();
+                    parts.push((c, self.compound()?));
                 }
+                Some(_) if had_ws => parts.push((' ', self.compound()?)),
+                Some(_) => return self.fail(),
             }
-            '[' => {
-                i += 1;
-                let st = i;
-                while i < chars.len() && !matches!(chars[i], '=' | ']' | '^' | '$' | '*' | '~') {
-                    i += 1;
+        }
+    }
+
+    fn compound(&mut self) -> R<Compound> {
+        let mut comp = Compound {
+            tag: None,
+            simple: Vec::new(),
+        };
+        match self.peek() {
+            Some('*') => {
+                self.i += 1;
+                comp.tag = Some("*".into());
+            }
+            Some(c) if is_ident(c) => comp.tag = Some(self.ident()?.to_ascii_lowercase()),
+            _ => {}
+        }
+        while let Some(c) = self.peek() {
+            match c {
+                '#' => {
+                    self.i += 1;
+                    comp.simple.push(Simple::Id(self.ident()?));
                 }
-                let name = chars[st..i]
-                    .iter()
-                    .collect::<String>()
-                    .trim()
-                    .to_ascii_lowercase();
-                let mut op = AttrOp::Exists;
-                match chars.get(i) {
-                    Some('=') => {
-                        op = AttrOp::Equals;
-                        i += 1;
-                    }
-                    Some(c @ ('^' | '$' | '*' | '~')) if chars.get(i + 1) == Some(&'=') => {
-                        op = match c {
-                            '^' => AttrOp::Prefix,
-                            '$' => AttrOp::Suffix,
-                            '*' => AttrOp::Contains,
-                            _ => AttrOp::Word,
-                        };
-                        i += 2;
-                    }
-                    _ => {}
+                '.' => {
+                    self.i += 1;
+                    comp.simple.push(Simple::Class(self.ident()?));
                 }
-                let mut value = String::new();
-                if op != AttrOp::Exists {
-                    let quote = match chars.get(i) {
-                        Some(q @ ('"' | '\'')) => {
-                            i += 1;
-                            Some(*q)
+                '[' => {
+                    self.i += 1;
+                    self.ws();
+                    let name = self.ident()?.to_ascii_lowercase();
+                    self.ws();
+                    let op = match (self.peek(), self.s.get(self.i + 1).copied()) {
+                        (Some('='), _) => {
+                            self.i += 1;
+                            Some("=")
+                        }
+                        (Some(a @ ('~' | '|' | '^' | '$' | '*')), Some('=')) => {
+                            self.i += 2;
+                            Some(match a {
+                                '~' => "~=",
+                                '|' => "|=",
+                                '^' => "^=",
+                                '$' => "$=",
+                                _ => "*=",
+                            })
                         }
                         _ => None,
                     };
-                    let vs = i;
-                    while i < chars.len() && chars[i] != ']' && Some(chars[i]) != quote {
-                        i += 1;
+                    let mut test = None;
+                    if let Some(op) = op {
+                        self.ws();
+                        let val = match self.peek() {
+                            Some(q @ ('\'' | '"')) => {
+                                let end = match self.s[self.i + 1..].iter().position(|&x| x == q) {
+                                    Some(e) => self.i + 1 + e,
+                                    None => return self.fail(),
+                                };
+                                let v: String = self.s[self.i + 1..end].iter().collect();
+                                self.i = end + 1;
+                                v
+                            }
+                            _ => self.ident()?,
+                        };
+                        self.ws();
+                        test = Some((op.into(), val));
                     }
-                    value = chars[vs..i].iter().collect();
-                    if quote.is_some() && i < chars.len() {
-                        i += 1;
+                    if self.peek() != Some(']') {
+                        return self.fail();
                     }
+                    self.i += 1;
+                    comp.simple.push(Simple::Attr(name, test));
                 }
-                while i < chars.len() && chars[i] != ']' {
-                    i += 1;
+                ':' => {
+                    self.i += 1;
+                    let name = self.ident()?.to_ascii_lowercase();
+                    let simple = match name.as_str() {
+                        "first-child" => Simple::FirstChild,
+                        "last-child" => Simple::LastChild,
+                        "only-child" => Simple::OnlyChild,
+                        "empty" => Simple::Empty,
+                        "nth-child" | "nth-last-child" | "not" => {
+                            if self.peek() != Some('(') {
+                                return self.fail();
+                            }
+                            self.i += 1;
+                            self.ws();
+                            let s = if name == "not" {
+                                let inner = self.compound()?;
+                                self.ws();
+                                Simple::Not(Box::new(inner))
+                            } else {
+                                let end = match self.s[self.i..].iter().position(|&x| x == ')') {
+                                    Some(e) => self.i + e,
+                                    None => return self.fail(),
+                                };
+                                let arg: String = self.s[self.i..end].iter().collect();
+                                let (a, b) = match parse_nth(&arg) {
+                                    Some(ab) => ab,
+                                    None => return self.fail(),
+                                };
+                                self.i = end;
+                                if name == "nth-child" {
+                                    Simple::NthChild(a, b)
+                                } else {
+                                    Simple::NthLastChild(a, b)
+                                }
+                            };
+                            if self.peek() != Some(')') {
+                                return self.fail();
+                            }
+                            self.i += 1;
+                            s
+                        }
+                        _ => return self.fail(),
+                    };
+                    comp.simple.push(simple);
                 }
-                i += 1;
-                s.attrs.push((name, op, value));
+                _ => break,
             }
-            _ => i += 1,
         }
+        if comp.tag.is_none() && comp.simple.is_empty() {
+            return self.fail();
+        }
+        Ok(comp)
     }
-    s
 }
 
-/// Parse `a > b c, d` into a list of complex selectors.
-pub fn parse_selector_list(sel: &str) -> Vec<Complex> {
-    sel.split(',')
-        .map(|part| {
-            let mut complex = Complex::default();
-            let mut comb = Combinator::Descendant;
-            let mut buf = String::new();
-            let flush = |buf: &mut String, comb: Combinator, complex: &mut Complex| {
-                if !buf.is_empty() {
-                    complex.parts.push((comb, parse_selector(buf)));
-                    buf.clear();
-                }
-            };
-            let mut pending_child = false;
-            for tok in part.replace('>', " > ").split_whitespace() {
-                if tok == ">" {
-                    flush(&mut buf, comb, &mut complex);
-                    pending_child = true;
-                    continue;
-                }
-                buf.push_str(tok);
-                let c = if pending_child {
-                    Combinator::Child
-                } else {
-                    Combinator::Descendant
-                };
-                pending_child = false;
-                comb = c;
-                flush(&mut buf, comb, &mut complex);
-            }
-            complex
-        })
-        .filter(|c| !c.parts.is_empty())
-        .collect()
+fn digits(s: &str, min: usize) -> Option<i64> {
+    if s.len() < min || s.len() > 9 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.is_empty() {
+        return Some(-1);
+    }
+    s.parse().ok()
 }
 
-fn attr_matches(node: &Node, name: &str, op: &AttrOp, expected: &str) -> bool {
-    let Some(actual) = node.attr(name) else {
-        return false;
+/// Parses an `An+B` argument; numbers have at most nine digits.
+fn parse_nth(text: &str) -> Option<(i64, i64)> {
+    let t = text.trim_matches(is_ws).to_ascii_lowercase();
+    match t.as_str() {
+        "odd" => return Some((2, 1)),
+        "even" => return Some((2, 0)),
+        _ => {}
+    }
+    let (sign, rest) = match t.as_bytes().first() {
+        Some(b'+') => (1, &t[1..]),
+        Some(b'-') => (-1, &t[1..]),
+        _ => (1, t.as_str()),
     };
-    match op {
-        AttrOp::Exists => true,
-        AttrOp::Equals => actual == expected,
-        AttrOp::Prefix => !expected.is_empty() && actual.starts_with(expected),
-        AttrOp::Suffix => !expected.is_empty() && actual.ends_with(expected),
-        AttrOp::Contains => !expected.is_empty() && actual.contains(expected),
-        AttrOp::Word => actual.split_whitespace().any(|w| w == expected),
+    let Some(npos) = rest.find('n') else {
+        return digits(rest, 1).map(|b| (0, sign * b));
+    };
+    let a = match digits(&rest[..npos], 0)? {
+        -1 => sign,
+        v => sign * v,
+    };
+    let tail = rest[npos + 1..].trim_start_matches(is_ws);
+    if tail.is_empty() {
+        return Some((a, 0));
+    }
+    let bsign = match tail.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let b = digits(tail[1..].trim_start_matches(is_ws), 1)?;
+    Some((a, bsign * b))
+}
+
+fn nth_ok(a: i64, b: i64, pos: i64) -> bool {
+    if a == 0 {
+        pos == b
+    } else if a > 0 {
+        pos >= b && (pos - b) % a == 0
+    } else {
+        pos <= b && (b - pos) % (-a) == 0
     }
 }
 
-fn compound_matches(node: &Node, sel: &Selector) -> bool {
-    if node.kind != NodeKind::Element {
-        return false;
-    }
-    if let Some(tag) = &sel.tag {
-        if node.tag.as_deref() != Some(tag.as_str()) {
+fn split_ws(s: &str) -> impl Iterator<Item = &str> {
+    s.split(is_ws).filter(|x| !x.is_empty())
+}
+
+fn match_compound(doc: &Document, id: NodeId, comp: &Compound, ctx: &mut Ctx) -> bool {
+    let el = doc.node(id);
+    if let Some(tag) = &comp.tag {
+        if tag != "*" && el.name != *tag {
             return false;
         }
     }
-    if let Some(id) = &sel.id {
-        if node.attr("id") != Some(id.as_str()) {
-            return false;
-        }
-    }
-    if !sel.classes.is_empty() {
-        let cls: Vec<&str> = node
-            .attr("class")
-            .unwrap_or("")
-            .split_whitespace()
-            .collect();
-        if !sel.classes.iter().all(|c| cls.contains(&c.as_str())) {
-            return false;
-        }
-    }
-    sel.attrs
-        .iter()
-        .all(|(n, op, v)| attr_matches(node, n, op, v))
-}
-
-/// Does `node` (with element `ancestors`, outermost first) match parts[..=idx]?
-fn complex_matches(
-    parts: &[(Combinator, Selector)],
-    idx: usize,
-    node: &Node,
-    ancestors: &[&Node],
-) -> bool {
-    if !compound_matches(node, &parts[idx].1) {
-        return false;
-    }
-    if idx == 0 {
-        return true;
-    }
-    match parts[idx].0 {
-        Combinator::Child => match ancestors.split_last() {
-            Some((parent, rest)) => complex_matches(parts, idx - 1, parent, rest),
-            None => false,
-        },
-        Combinator::Descendant => (0..ancestors.len())
-            .rev()
-            .any(|k| complex_matches(parts, idx - 1, ancestors[k], &ancestors[..k])),
-    }
-}
-
-/// Query every descendant of `root` matching `selector` (list allowed),
-/// in document order.
-pub fn query<'a>(root: &'a Node, selector: &str) -> Vec<&'a Node> {
-    let list = parse_selector_list(selector);
-    let mut out = Vec::new();
-    if list.is_empty() {
-        return out;
-    }
-    let mut ancestors: Vec<&Node> = Vec::new();
-    walk(root, &list, &mut ancestors, &mut out);
-    out
-}
-
-fn walk<'a>(
-    node: &'a Node,
-    list: &[Complex],
-    ancestors: &mut Vec<&'a Node>,
-    out: &mut Vec<&'a Node>,
-) {
-    for c in &node.children {
-        if c.kind == NodeKind::Element
-            && list
+    for s in &comp.simple {
+        let ok = match s {
+            Simple::Id(v) => el.attr("id") == Some(v.as_str()),
+            Simple::Class(v) => split_ws(el.attr("class").unwrap_or("")).any(|c| c == v),
+            Simple::Attr(name, test) => match (el.attr(name), test) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(v), Some((op, val))) => match op.as_str() {
+                    "=" => v == val,
+                    "~=" => split_ws(v).any(|c| c == val),
+                    "|=" => {
+                        v == val
+                            || v.strip_prefix(val.as_str())
+                                .is_some_and(|r| r.starts_with('-'))
+                    }
+                    "^=" => !val.is_empty() && v.starts_with(val.as_str()),
+                    "$=" => !val.is_empty() && v.ends_with(val.as_str()),
+                    _ => !val.is_empty() && v.contains(val.as_str()),
+                },
+            },
+            Simple::Empty => !el
+                .children
                 .iter()
-                .any(|cx| complex_matches(&cx.parts, cx.parts.len() - 1, c, ancestors))
-        {
-            out.push(c);
+                .any(|&c| matches!(doc.node(c).kind, NodeKind::Element | NodeKind::Text)),
+            Simple::Not(inner) => !match_compound(doc, id, inner, ctx),
+            _ => {
+                let (idx, len) = ctx.position(doc, id);
+                let (pos, len) = (idx as i64 + 1, len as i64);
+                match s {
+                    Simple::FirstChild => pos == 1,
+                    Simple::LastChild => pos == len,
+                    Simple::OnlyChild => len == 1,
+                    Simple::NthChild(a, b) => nth_ok(*a, *b, pos),
+                    Simple::NthLastChild(a, b) => nth_ok(*a, *b, len - pos + 1),
+                    _ => true,
+                }
+            }
+        };
+        if !ok {
+            return false;
         }
-        if c.kind == NodeKind::Element {
-            ancestors.push(c);
-            walk(c, list, ancestors, out);
-            ancestors.pop();
+    }
+    true
+}
+
+fn is_element(doc: &Document, id: NodeId) -> bool {
+    doc.node(id).kind == NodeKind::Element
+}
+
+/// Per-query caches: element-sibling positions per parent, match results per
+/// (step, node) and the first sibling matching a step (for `~`). They keep
+/// matching linear in the number of siblings and in the tree depth; results
+/// are unchanged.
+#[derive(Default)]
+struct Ctx {
+    siblings: BTreeMap<NodeId, Vec<NodeId>>,
+    position: BTreeMap<NodeId, (usize, usize)>,
+    memo: BTreeMap<(usize, NodeId), bool>,
+    first: BTreeMap<(usize, NodeId), usize>,
+}
+
+impl Ctx {
+    fn siblings(&mut self, doc: &Document, id: NodeId) -> (Option<NodeId>, &[NodeId]) {
+        let Some(parent) = doc.node(id).parent else {
+            return (None, &[]);
+        };
+        if !self.siblings.contains_key(&parent) {
+            let sib = doc.element_siblings(id);
+            let len = sib.len();
+            for (i, &x) in sib.iter().enumerate() {
+                self.position.insert(x, (i, len));
+            }
+            self.siblings.insert(parent, sib);
+        }
+        (Some(parent), &self.siblings[&parent])
+    }
+
+    /// Zero-based index among element siblings and their count.
+    fn position(&mut self, doc: &Document, id: NodeId) -> (usize, usize) {
+        if self.siblings(doc, id).0.is_none() {
+            return (0, 1);
+        }
+        self.position[&id]
+    }
+}
+
+struct Matcher<'a> {
+    doc: &'a Document,
+    parts: &'a Complex,
+    /// Offset of this complex selector's steps in the memo keys.
+    base: usize,
+}
+
+impl Matcher<'_> {
+    fn matches(&self, id: NodeId, k: usize, ctx: &mut Ctx) -> bool {
+        let key = (self.base + k, id);
+        if let Some(&hit) = ctx.memo.get(&key) {
+            return hit;
+        }
+        let hit = self.step(id, k, ctx);
+        ctx.memo.insert(key, hit);
+        hit
+    }
+
+    fn step(&self, id: NodeId, k: usize, ctx: &mut Ctx) -> bool {
+        let doc = self.doc;
+        let (comb, comp) = &self.parts[k];
+        if !match_compound(doc, id, comp, ctx) {
+            return false;
+        }
+        if k == 0 {
+            return true;
+        }
+        match comb {
+            '>' => doc
+                .node(id)
+                .parent
+                .is_some_and(|p| is_element(doc, p) && self.matches(p, k - 1, ctx)),
+            ' ' => {
+                let mut p = doc.node(id).parent;
+                while let Some(pid) = p {
+                    if !is_element(doc, pid) {
+                        break;
+                    }
+                    if self.matches(pid, k - 1, ctx) {
+                        return true;
+                    }
+                    p = doc.node(pid).parent;
+                }
+                false
+            }
+            _ => {
+                let (idx, _) = ctx.position(doc, id);
+                let Some(parent) = doc.node(id).parent else {
+                    return false;
+                };
+                if *comb == '+' {
+                    let prev = if idx > 0 {
+                        Some(ctx.siblings(doc, id).1[idx - 1])
+                    } else {
+                        None
+                    };
+                    return prev.is_some_and(|x| self.matches(x, k - 1, ctx));
+                }
+                let fkey = (self.base + k, parent);
+                let first = match ctx.first.get(&fkey) {
+                    Some(&f) => f,
+                    None => {
+                        let sib = ctx.siblings(doc, id).1.to_vec();
+                        let f = sib
+                            .iter()
+                            .position(|&x| self.matches(x, k - 1, ctx))
+                            .unwrap_or(sib.len());
+                        ctx.first.insert(fkey, f);
+                        f
+                    }
+                };
+                first < idx
+            }
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dom::parse;
+/// A parsed selector list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selector {
+    list: Vec<Complex>,
+}
 
-    #[test]
-    fn tag_id_class_attr() {
-        let doc = parse(r#"<div id="main" class="card x"><p class="card">a</p></div><p>b</p>"#);
-        assert_eq!(query(&doc, "p").len(), 2);
-        assert_eq!(query(&doc, "#main").len(), 1);
-        assert_eq!(query(&doc, ".card").len(), 2);
-        assert_eq!(query(&doc, "div.card#main").len(), 1);
-        assert_eq!(query(&doc, "*").len(), 3);
+impl Selector {
+    /// Parses `selector` (SPEC section 8.1).
+    pub fn parse(selector: &str) -> Result<Selector, SelectorError> {
+        let mut p = Parser {
+            s: selector.chars().collect(),
+            i: 0,
+        };
+        Ok(Selector { list: p.list()? })
     }
 
-    #[test]
-    fn attribute_operators() {
-        let doc = parse(
-            r#"<a href="https://x.com/a.pdf" rel="nofollow noopener">l</a><a href="/b">m</a>"#,
-        );
-        assert_eq!(query(&doc, "[href]").len(), 2);
-        assert_eq!(query(&doc, "[href^=https]").len(), 1);
-        assert_eq!(query(&doc, "[href$='.pdf']").len(), 1);
-        assert_eq!(query(&doc, "[href*=x.com]").len(), 1);
-        assert_eq!(query(&doc, "[rel~=noopener]").len(), 1);
-        assert_eq!(query(&doc, "[rel~=nofollow]").len(), 1);
-        assert_eq!(query(&doc, "[href='/b']").len(), 1);
+    /// True when element `id` matches.
+    pub fn matches(&self, doc: &Document, id: NodeId) -> bool {
+        self.matches_with(doc, id, &mut Ctx::default())
     }
 
-    #[test]
-    fn descendant_and_child_combinators() {
-        let doc = parse("<div><section><p>deep</p></section><p>direct</p></div><p>outside</p>");
-        assert_eq!(query(&doc, "div p").len(), 2);
-        assert_eq!(query(&doc, "div > p").len(), 1);
-        assert_eq!(query(&doc, "div>p").len(), 1);
-        assert_eq!(query(&doc, "div > section > p").len(), 1);
-        assert_eq!(query(&doc, "section p").len(), 1);
-    }
-
-    #[test]
-    fn selector_list_in_document_order() {
-        let doc = parse("<h1>a</h1><p>b</p><h2>c</h2>");
-        let r = query(&doc, "h2, h1");
-        assert_eq!(r.len(), 2);
-        assert!(r[0].is_element("h1"));
-    }
-
-    #[test]
-    fn descendant_backtracking() {
-        let doc = parse("<div class=a><div class=b><span>x</span></div></div>");
-        assert_eq!(query(&doc, ".a span").len(), 1);
-        assert_eq!(query(&doc, ".a > span").len(), 0);
-        assert_eq!(query(&doc, ".a > .b > span").len(), 1);
-    }
-
-    #[test]
-    fn garbage_selectors_do_not_panic() {
-        let doc = parse("<p>x</p>");
-        for s in [
-            "", ">", ",,,", "[", "[a", "[a=", "#", ".", "a >", "> a", "[=]", "a[b^=]",
-        ] {
-            let _ = query(&doc, s);
+    fn matches_with(&self, doc: &Document, id: NodeId, ctx: &mut Ctx) -> bool {
+        if !is_element(doc, id) {
+            return false;
         }
+        let mut base = 0;
+        for parts in &self.list {
+            let m = Matcher { doc, parts, base };
+            if m.matches(id, parts.len() - 1, ctx) {
+                return true;
+            }
+            base += parts.len();
+        }
+        false
+    }
+}
+
+impl Document {
+    /// Elements matching `selector`, in document order (SPEC section 8.2).
+    pub fn query(&self, selector: &str) -> Result<Vec<NodeId>, SelectorError> {
+        let sel = Selector::parse(selector)?;
+        let mut ctx = Ctx::default();
+        Ok(self
+            .elements()
+            .into_iter()
+            .filter(|&id| sel.matches_with(self, id, &mut ctx))
+            .collect())
     }
 }

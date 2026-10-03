@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lombokhtml"
+version = "0.2.0"
+description = "WHATWG HTML tokenizer (html5lib-tests conformant), tree builder, serializer, text extraction, allowlist sanitizer, CSS selector subset, meta and table extraction with identical results in Python, Rust, TypeScript, Go and PHP. No dependencies."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "codinglombok" }]
+requires-python = ">=3.9"
+keywords = ["html", "parser", "tokenizer", "whatwg", "sanitizer", "css-selector", "html-to-text"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Text Processing :: Markup :: HTML",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/codinglombok/LombokHTML"
+Issues = "https://github.com/codinglombok/LombokHTML/issues"
+
+[tool.setuptools]
+packages = ["lombokhtml"]
+
+[tool.setuptools.package-data]
+lombokhtml = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

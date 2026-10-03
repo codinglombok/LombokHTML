@@ -1,0 +1,32 @@
+{
+    "name": "codinglombok/lombokhtml",
+    "description": "WHATWG HTML tokenizer (html5lib-tests conformant), tree builder, serializer, text extraction, allowlist sanitizer, CSS selector subset, meta and table extraction with identical results in PHP, Rust, TypeScript, Go and Python. No dependencies.",
+    "type": "library",
+    "license": "Apache-2.0",
+    "keywords": [
+        "html",
+        "parser",
+        "tokenizer",
+        "whatwg",
+        "sanitizer",
+        "css-selector",
+        "html-to-text"
+    ],
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "LombokHTML\\": "src/"
+        }
+    },
+    "homepage": "https://github.com/codinglombok/LombokHTML",
+    "authors": [
+        {
+            "name": "codinglombok"
+        }
+    ],
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}

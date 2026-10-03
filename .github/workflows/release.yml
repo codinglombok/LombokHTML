@@ -1,12 +1,82 @@
-# Salin ke <Repo>/.github/workflows/release.yml  (ganti LombokHTML & lombokhtml)
-name: release
+# Release — publishes each port on a v* tag after re-running its tests.
+name: Release
+
 on:
   push:
-    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
 jobs:
-  lombok-release:
-    uses: codinglombok/.github/.github/workflows/lombok-release.yml@main
-    with:
-      repo_name: LombokHTML
-      package_name: lombokhtml
-    secrets: inherit
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Tag matches every manifest
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          grep -q "^version = \"$v\"" rust/Cargo.toml
+          grep -q "\"version\": \"$v\"" typescript/package.json
+          grep -q "^version = \"$v\"" python/pyproject.toml
+          grep -q "__version__ = \"$v\"" python/lombokhtml/__init__.py
+          bash scripts/lombok-doctor.sh LombokHTML
+
+  crates:
+    needs: check-version
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - run: cargo test
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  npm:
+    needs: check-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: typescript
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  pypi:
+    needs: check-version
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install pytest build
+      - run: python -m pytest -q
+        working-directory: python
+      - run: python -m build
+        working-directory: python
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: python/dist

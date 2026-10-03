@@ -1,13 +1,15 @@
-//! Builds a DOM-like tree from the token stream. Error-tolerant like a
-//! browser parser (scope item 1/5): a stray end tag closes back up the
-//! stack to the nearest matching ancestor if one exists, and is dropped
-//! silently otherwise; an unclosed tag at EOF is auto-closed.
+//! Tree construction subset, serialization and text extraction (SPEC sections 4 to 6).
 
-use crate::tokenizer::{is_void_element, tokenize, Token};
+use crate::entities::{escape_attr, escape_text};
+use crate::tokenizer::{tokenize, Token};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-#[derive(Debug, Clone, PartialEq)]
+/// Index of a node inside its [`Document`].
+pub type NodeId = usize;
+
+/// What a node is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     Document,
     Element,
@@ -15,58 +17,30 @@ pub enum NodeKind {
     Comment,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// One node. `name` and `attrs` are set for elements, `data` for text and comments.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Node {
     pub kind: NodeKind,
-    /// Lowercase tag name, only set for `Element`.
-    pub tag: Option<String>,
+    pub name: String,
     pub attrs: Vec<(String, String)>,
-    /// Raw text, only set for `Text`/`Comment`.
-    pub text: Option<String>,
-    pub children: Vec<Node>,
+    pub data: String,
+    pub parent: Option<NodeId>,
+    pub children: Vec<NodeId>,
 }
 
 impl Node {
-    fn element(tag: String, attrs: Vec<(String, String)>) -> Self {
+    fn new(kind: NodeKind, name: String, attrs: Vec<(String, String)>, data: String) -> Node {
         Node {
-            kind: NodeKind::Element,
-            tag: Some(tag),
+            kind,
+            name,
             attrs,
-            text: None,
+            data,
+            parent: None,
             children: Vec::new(),
         }
     }
 
-    fn text(t: String) -> Self {
-        Node {
-            kind: NodeKind::Text,
-            tag: None,
-            attrs: Vec::new(),
-            text: Some(t),
-            children: Vec::new(),
-        }
-    }
-
-    fn comment(t: String) -> Self {
-        Node {
-            kind: NodeKind::Comment,
-            tag: None,
-            attrs: Vec::new(),
-            text: Some(t),
-            children: Vec::new(),
-        }
-    }
-
-    pub fn document() -> Self {
-        Node {
-            kind: NodeKind::Document,
-            tag: None,
-            attrs: Vec::new(),
-            text: None,
-            children: Vec::new(),
-        }
-    }
-
+    /// Value of the first attribute called `name`.
     pub fn attr(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
@@ -74,163 +48,649 @@ impl Node {
             .map(|(_, v)| v.as_str())
     }
 
-    pub fn is_element(&self, tag: &str) -> bool {
-        self.kind == NodeKind::Element && self.tag.as_deref() == Some(tag)
+    /// True for an element called `name`.
+    pub fn is(&self, name: &str) -> bool {
+        self.kind == NodeKind::Element && self.name == name
+    }
+}
+
+/// A parsed document. Node 0 is the document node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Document {
+    nodes: Vec<Node>,
+}
+
+pub(crate) const VOID: &[&str] = &[
+    "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr", "img", "input",
+    "keygen", "link", "meta", "param", "source", "track", "wbr",
+];
+pub(crate) const RAW_PARENTS: &[&str] = &[
+    "style",
+    "script",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "plaintext",
+    "noscript",
+];
+const SPECIAL: &[&str] = &[
+    "address",
+    "applet",
+    "area",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "bgsound",
+    "blockquote",
+    "body",
+    "br",
+    "button",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "embed",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hgroup",
+    "hr",
+    "html",
+    "iframe",
+    "img",
+    "input",
+    "keygen",
+    "li",
+    "link",
+    "listing",
+    "main",
+    "marquee",
+    "menu",
+    "meta",
+    "nav",
+    "noembed",
+    "noframes",
+    "noscript",
+    "object",
+    "ol",
+    "p",
+    "param",
+    "plaintext",
+    "pre",
+    "script",
+    "search",
+    "section",
+    "select",
+    "source",
+    "style",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "template",
+    "textarea",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+    "wbr",
+    "xmp",
+];
+const P_CLOSERS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "center",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hgroup",
+    "hr",
+    "li",
+    "dd",
+    "dt",
+    "listing",
+    "main",
+    "menu",
+    "nav",
+    "ol",
+    "p",
+    "plaintext",
+    "pre",
+    "search",
+    "section",
+    "summary",
+    "table",
+    "ul",
+    "xmp",
+];
+pub(crate) const HEADINGS: &[&str] = &["h1", "h2", "h3", "h4", "h5", "h6"];
+const SCOPE: &[&str] = &[
+    "applet", "caption", "html", "table", "td", "th", "marquee", "object", "template",
+];
+const BUTTON_SCOPE: &[&str] = &[
+    "applet", "caption", "html", "table", "td", "th", "marquee", "object", "template", "button",
+];
+const LIST_SCOPE: &[&str] = &[
+    "applet", "caption", "html", "table", "td", "th", "marquee", "object", "template", "ol", "ul",
+];
+const TABLE_SCOPE: &[&str] = &["html", "table", "template"];
+const TABLE_PARTS: &[&str] = &[
+    "table", "caption", "tbody", "thead", "tfoot", "tr", "td", "th",
+];
+const HIDDEN: &[&str] = &["script", "style", "noscript", "template", "title"];
+const BLOCKS: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "caption",
+    "details",
+    "dialog",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "header",
+    "hgroup",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "summary",
+    "table",
+    "ul",
+];
+const SECTIONS: &[&str] = &["thead", "tbody", "tfoot"];
+
+/// Maximum number of open elements; deeper start tags are ignored.
+pub const MAX_DEPTH: usize = 256;
+
+fn has(set: &[&str], name: &str) -> bool {
+    set.contains(&name)
+}
+
+struct Builder {
+    doc: Document,
+    stack: Vec<NodeId>,
+}
+
+impl Builder {
+    fn name(&self, id: NodeId) -> &str {
+        &self.doc.nodes[id].name
     }
 
-    /// Depth-first, pre-order iteration over this node and all descendants.
-    pub fn walk<'a>(&'a self, f: &mut dyn FnMut(&'a Node)) {
-        f(self);
-        for c in &self.children {
-            c.walk(f);
-        }
+    fn current(&self) -> NodeId {
+        self.stack.last().copied().unwrap_or(0)
     }
 
-    /// First descendant (or self) matching `tag`, depth-first.
-    pub fn find_first(&self, tag: &str) -> Option<&Node> {
-        if self.is_element(tag) {
-            return Some(self);
-        }
-        for c in &self.children {
-            if let Some(found) = c.find_first(tag) {
-                return Some(found);
+    fn append(&mut self, node: Node) -> NodeId {
+        let parent = self.current();
+        let id = self.doc.nodes.len();
+        let mut node = node;
+        node.parent = Some(parent);
+        self.doc.nodes.push(node);
+        self.doc.nodes[parent].children.push(id);
+        id
+    }
+
+    fn add_text(&mut self, data: &str) {
+        let parent = self.current();
+        if let Some(&last) = self.doc.nodes[parent].children.last() {
+            if self.doc.nodes[last].kind == NodeKind::Text {
+                self.doc.nodes[last].data.push_str(data);
+                return;
             }
         }
-        None
+        self.append(Node::new(
+            NodeKind::Text,
+            String::new(),
+            Vec::new(),
+            data.into(),
+        ));
     }
 
-    /// All descendants (not self) matching `tag`, depth-first.
-    pub fn find_all(&self, tag: &str) -> Vec<&Node> {
+    fn in_scope(&self, names: &[&str], boundary: &[&str]) -> bool {
+        for &id in self.stack.iter().rev() {
+            let n = self.name(id);
+            if has(names, n) {
+                return true;
+            }
+            if has(boundary, n) {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn pop_until(&mut self, names: &[&str]) {
+        while let Some(id) = self.stack.pop() {
+            if has(names, self.name(id)) {
+                return;
+            }
+        }
+    }
+
+    /// Returns true when a following newline is dropped.
+    fn start(&mut self, name: String, attrs: Vec<(String, String)>) -> bool {
+        let n = name.as_str();
+        if n == "li" || n == "dd" || n == "dt" {
+            let targets: &[&str] = if n == "li" { &["li"] } else { &["dd", "dt"] };
+            for idx in (0..self.stack.len()).rev() {
+                let cur = self.name(self.stack[idx]);
+                if has(targets, cur) {
+                    self.stack.truncate(idx);
+                    break;
+                }
+                if has(SPECIAL, cur) && !matches!(cur, "address" | "div" | "p") {
+                    break;
+                }
+            }
+        }
+        if has(P_CLOSERS, n) && self.in_scope(&["p"], BUTTON_SCOPE) {
+            self.pop_until(&["p"]);
+        }
+        if has(HEADINGS, n)
+            && self
+                .stack
+                .last()
+                .is_some_and(|&t| has(HEADINGS, self.name(t)))
+        {
+            self.stack.pop();
+        }
+        if (n == "option" || n == "optgroup")
+            && self.stack.last().is_some_and(|&t| self.name(t) == "option")
+        {
+            self.stack.pop();
+        }
+        if n == "a" && self.stack.iter().any(|&t| self.name(t) == "a") {
+            self.pop_until(&["a"]);
+        }
+        if matches!(n, "td" | "th" | "tr" | "thead" | "tbody" | "tfoot")
+            && self.in_scope(&["td", "th"], TABLE_SCOPE)
+        {
+            self.pop_until(&["td", "th"]);
+        }
+        if matches!(n, "tr" | "thead" | "tbody" | "tfoot") && self.in_scope(&["tr"], TABLE_SCOPE) {
+            self.pop_until(&["tr"]);
+        }
+        if has(SECTIONS, n) && self.in_scope(SECTIONS, TABLE_SCOPE) {
+            self.pop_until(SECTIONS);
+        }
+        if self.stack.len() >= MAX_DEPTH {
+            return false;
+        }
+        let skip = matches!(n, "pre" | "listing" | "textarea");
+        let void = has(VOID, n);
+        let id = self.append(Node::new(NodeKind::Element, name, attrs, String::new()));
+        if !void {
+            self.stack.push(id);
+        }
+        skip
+    }
+
+    fn end(&mut self, name: &str) {
+        if name == "br" {
+            self.start("br".into(), Vec::new());
+            return;
+        }
+        let (target, boundary): (&[&str], &[&str]) = if name == "p" {
+            (&["p"], BUTTON_SCOPE)
+        } else if has(HEADINGS, name) {
+            (HEADINGS, SCOPE)
+        } else if name == "li" {
+            (&["li"], LIST_SCOPE)
+        } else if name == "dd" || name == "dt" || has(SPECIAL, name) && !has(TABLE_PARTS, name) {
+            (core::slice::from_ref(&name), SCOPE)
+        } else if has(TABLE_PARTS, name) {
+            (core::slice::from_ref(&name), TABLE_SCOPE)
+        } else {
+            for idx in (0..self.stack.len()).rev() {
+                let cur = self.name(self.stack[idx]);
+                if cur == name {
+                    self.stack.truncate(idx);
+                    return;
+                }
+                if has(SPECIAL, cur) {
+                    return;
+                }
+            }
+            return;
+        };
+        if self.in_scope(target, boundary) {
+            self.pop_until(target);
+        }
+    }
+}
+
+/// Parses `html` into a [`Document`] (SPEC section 4). Never fails.
+pub fn parse(html: &str) -> Document {
+    let mut b = Builder {
+        doc: Document {
+            nodes: alloc::vec![Node::new(
+                NodeKind::Document,
+                String::new(),
+                Vec::new(),
+                String::new()
+            )],
+        },
+        stack: Vec::new(),
+    };
+    let mut skip_newline = false;
+    for tok in tokenize(html) {
+        match tok {
+            Token::Character(data) => {
+                let d = if skip_newline {
+                    data.strip_prefix('\n').unwrap_or(&data)
+                } else {
+                    &data
+                };
+                skip_newline = false;
+                if !d.is_empty() {
+                    b.add_text(d);
+                }
+            }
+            Token::StartTag { name, attrs, .. } => skip_newline = b.start(name, attrs),
+            Token::EndTag { name } => {
+                skip_newline = false;
+                b.end(&name);
+            }
+            Token::Comment(data) => {
+                skip_newline = false;
+                b.append(Node::new(
+                    NodeKind::Comment,
+                    String::new(),
+                    Vec::new(),
+                    data,
+                ));
+            }
+            Token::Doctype { .. } => skip_newline = false,
+        }
+    }
+    b.doc
+}
+
+impl Document {
+    /// The document node.
+    pub fn root(&self) -> NodeId {
+        0
+    }
+
+    /// The node with index `id`. Panics when `id` is out of range.
+    pub fn node(&self, id: NodeId) -> &Node {
+        &self.nodes[id]
+    }
+
+    /// Number of nodes, including the document node.
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// True when the document has no children.
+    pub fn is_empty(&self) -> bool {
+        self.nodes[0].children.is_empty()
+    }
+
+    /// Elements below `id` in document order.
+    pub fn descendants(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
-        for c in &self.children {
-            if c.is_element(tag) {
-                out.push(c);
+        let mut todo: Vec<NodeId> = self.nodes[id].children.iter().rev().copied().collect();
+        while let Some(n) = todo.pop() {
+            if self.nodes[n].kind == NodeKind::Element {
+                out.push(n);
+                todo.extend(self.nodes[n].children.iter().rev().copied());
             }
-            out.extend(c.find_all(tag));
         }
         out
     }
-}
 
-/// Maximum element nesting kept in the tree; deeper start tags are attached as
-/// leaves so recursive walkers can never overflow the stack (U7).
-pub const MAX_DEPTH: usize = 256;
+    /// All elements in document order.
+    pub fn elements(&self) -> Vec<NodeId> {
+        self.descendants(0)
+    }
 
-/// Parse an HTML document into a [`Node::document()`] tree.
-pub fn parse(html: &str) -> Node {
-    let tokens = tokenize(html);
-    let mut root = Node::document();
-    // Stack of indices-into-parent-children paths isn't cheap to splice in
-    // a plain Vec<Node> tree, so we build with an explicit stack of owned
-    // "open element" nodes and fold children in as we close tags.
-    let mut stack: Vec<Node> = Vec::new();
-
-    let push_child = |stack: &mut Vec<Node>, root: &mut Node, child: Node| {
-        if let Some(top) = stack.last_mut() {
-            top.children.push(child);
-        } else {
-            root.children.push(child);
+    /// Element children of the parent of `id`, `id` included.
+    pub(crate) fn element_siblings(&self, id: NodeId) -> Vec<NodeId> {
+        match self.nodes[id].parent {
+            Some(p) => self.nodes[p]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.nodes[c].kind == NodeKind::Element)
+                .collect(),
+            None => alloc::vec![id],
         }
-    };
+    }
 
-    for tok in tokens {
-        match tok {
-            Token::Doctype(_) => { /* not represented in the tree */ }
-            Token::Comment(c) => push_child(&mut stack, &mut root, Node::comment(c)),
-            Token::Text(t) => push_child(&mut stack, &mut root, Node::text(t)),
-            Token::StartTag {
-                name,
-                attrs,
-                self_closing,
-            } => {
-                let node = Node::element(name.clone(), attrs);
-                if self_closing || is_void_element(&name) || stack.len() >= MAX_DEPTH {
-                    push_child(&mut stack, &mut root, node);
+    /// HTML serialization of `id` (SPEC section 5): the outer HTML of an
+    /// element, the inner HTML of the document.
+    pub fn serialize(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        self.write(id, &mut out);
+        out
+    }
+
+    fn write(&self, id: NodeId, out: &mut String) {
+        let n = &self.nodes[id];
+        match n.kind {
+            NodeKind::Text => {
+                let raw = n.parent.is_some_and(|p| {
+                    let pn = &self.nodes[p];
+                    pn.kind == NodeKind::Element && has(RAW_PARENTS, &pn.name)
+                });
+                if raw {
+                    out.push_str(&n.data);
                 } else {
-                    stack.push(node);
+                    out.push_str(&escape_text(&n.data));
                 }
             }
-            Token::EndTag { name } => {
-                // Find the nearest matching open element on the stack.
-                if let Some(pos) = stack
-                    .iter()
-                    .rposition(|n| n.tag.as_deref() == Some(name.as_str()))
-                {
-                    // Close everything above `pos` too (mismatched nesting):
-                    // fold each closed node into its new parent in order.
-                    while stack.len() > pos {
-                        let closed = stack.pop().unwrap();
-                        push_child(&mut stack, &mut root, closed);
+            NodeKind::Comment => {
+                out.push_str("<!--");
+                out.push_str(&n.data);
+                out.push_str("-->");
+            }
+            NodeKind::Element => {
+                out.push('<');
+                out.push_str(&n.name);
+                for (k, v) in &n.attrs {
+                    out.push(' ');
+                    out.push_str(k);
+                    out.push_str("=\"");
+                    out.push_str(&escape_attr(v));
+                    out.push('"');
+                }
+                out.push('>');
+                if has(VOID, &n.name) {
+                    return;
+                }
+                for &c in &n.children {
+                    self.write(c, out);
+                }
+                out.push_str("</");
+                out.push_str(&n.name);
+                out.push('>');
+            }
+            NodeKind::Document => {
+                for &c in &n.children {
+                    self.write(c, out);
+                }
+            }
+        }
+    }
+
+    /// Concatenated text below `id`, skipping script, style, noscript,
+    /// template and title (SPEC section 6.1).
+    pub fn text_content(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        self.text_into(id, &mut out);
+        out
+    }
+
+    fn text_into(&self, id: NodeId, out: &mut String) {
+        let n = &self.nodes[id];
+        match n.kind {
+            NodeKind::Text => out.push_str(&n.data),
+            NodeKind::Comment => {}
+            NodeKind::Element if has(HIDDEN, &n.name) => {}
+            _ => {
+                for &c in &n.children {
+                    self.text_into(c, out);
+                }
+            }
+        }
+    }
+
+    /// Structure-preserving plain text of `id` (SPEC section 6.2).
+    pub fn extract_text(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        self.extract_into(id, false, &mut out);
+        let mut lines = String::with_capacity(out.len());
+        for (i, line) in out.split('\n').enumerate() {
+            if i > 0 {
+                lines.push('\n');
+            }
+            lines.push_str(line.trim_end_matches([' ', '\t']));
+        }
+        let mut squeezed = String::with_capacity(lines.len());
+        let mut newlines = 0;
+        for c in lines.chars() {
+            if c == '\n' {
+                newlines += 1;
+                if newlines <= 2 {
+                    squeezed.push(c);
+                }
+            } else {
+                newlines = 0;
+                squeezed.push(c);
+            }
+        }
+        squeezed.trim_matches('\n').into()
+    }
+
+    fn extract_into(&self, id: NodeId, pre: bool, out: &mut String) {
+        let n = &self.nodes[id];
+        match n.kind {
+            NodeKind::Text => {
+                if pre {
+                    out.push_str(&n.data);
+                    return;
+                }
+                let mut collapsed = String::with_capacity(n.data.len());
+                let mut in_ws = false;
+                for c in n.data.chars() {
+                    if matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ') {
+                        if !in_ws {
+                            collapsed.push(' ');
+                        }
+                        in_ws = true;
+                    } else {
+                        collapsed.push(c);
+                        in_ws = false;
                     }
                 }
-                // else: stray end tag with no open match — dropped.
+                let at_break = matches!(out.chars().last(), None | Some(' ' | '\n' | '\t'));
+                let text = if at_break {
+                    collapsed.strip_prefix(' ').unwrap_or(&collapsed)
+                } else {
+                    &collapsed
+                };
+                out.push_str(text);
+            }
+            NodeKind::Comment => {}
+            NodeKind::Document => {
+                for &c in &n.children {
+                    self.extract_into(c, pre, out);
+                }
+            }
+            NodeKind::Element => {
+                let name = n.name.as_str();
+                if has(HIDDEN, name) {
+                    return;
+                }
+                if has(HEADINGS, name) {
+                    out.push_str("\n\n");
+                    let level = (name.as_bytes()[1] - b'0') as usize;
+                    for _ in 0..level {
+                        out.push('#');
+                    }
+                    out.push(' ');
+                    for &c in &n.children {
+                        self.extract_into(c, pre, out);
+                    }
+                    out.push_str("\n\n");
+                    return;
+                }
+                match name {
+                    "li" => out.push_str("\n- "),
+                    "dd" | "dt" | "tr" => out.push('\n'),
+                    "br" => {
+                        out.push('\n');
+                        return;
+                    }
+                    "hr" => {
+                        out.push_str("\n\n---\n\n");
+                        return;
+                    }
+                    _ => {}
+                }
+                let block = has(BLOCKS, name);
+                if block {
+                    out.push_str("\n\n");
+                }
+                let inner_pre = pre || matches!(name, "pre" | "listing" | "textarea");
+                for &c in &n.children {
+                    self.extract_into(c, inner_pre, out);
+                }
+                if name == "td" || name == "th" {
+                    out.push('\t');
+                }
+                if block {
+                    out.push_str("\n\n");
+                }
             }
         }
-    }
-    // EOF with unclosed tags: fold whatever remains, innermost first.
-    while let Some(closed) = stack.pop() {
-        push_child(&mut stack, &mut root, closed);
-    }
-
-    root
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_simple_tree() {
-        let doc = parse("<div><p>Hello</p></div>");
-        let div = &doc.children[0];
-        assert!(div.is_element("div"));
-        let p = &div.children[0];
-        assert!(p.is_element("p"));
-        assert_eq!(p.children[0].text.as_deref(), Some("Hello"));
-    }
-
-    #[test]
-    fn void_elements_have_no_children_and_stay_at_level() {
-        let doc = parse("<div><img src=\"a.png\"><p>x</p></div>");
-        let div = &doc.children[0];
-        assert_eq!(div.children.len(), 2);
-        assert!(div.children[0].is_element("img"));
-        assert!(div.children[0].children.is_empty());
-    }
-
-    #[test]
-    fn unclosed_tag_at_eof_is_auto_closed() {
-        let doc = parse("<div><p>unterminated");
-        assert!(doc.find_first("div").is_some());
-        assert!(doc.find_first("p").is_some());
-        let p = doc.find_first("p").unwrap();
-        assert_eq!(p.children[0].text.as_deref(), Some("unterminated"));
-    }
-
-    #[test]
-    fn mismatched_nesting_recovers() {
-        // <b><i>text</b></i> -- browsers close <i> when </b> arrives.
-        let doc = parse("<b><i>text</b></i>");
-        let b = doc.find_first("b").unwrap();
-        assert!(b.find_first("i").is_some());
-    }
-
-    #[test]
-    fn stray_end_tag_is_dropped() {
-        let doc = parse("<p>hello</span>world</p>");
-        let p = doc.find_first("p").unwrap();
-        // Both text runs should end up inside <p>, the stray </span> ignored.
-        let texts: Vec<&str> = p
-            .children
-            .iter()
-            .filter_map(|c| c.text.as_deref())
-            .collect();
-        assert_eq!(texts, alloc::vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn find_all_collects_every_match() {
-        let doc = parse("<ul><li>a</li><li>b</li><li>c</li></ul>");
-        assert_eq!(doc.find_first("ul").unwrap().find_all("li").len(), 3);
     }
 }

@@ -1,45 +1,59 @@
 {
   "name": "lombokhtml",
-  "version": "0.1.0",
-  "description": "Zero-dependency HTML ingestion: tolerant parser, DOM, entity decoding, allowlist sanitizer, selectors, meta and table extraction. Byte-identical with the Rust reference.",
-  "license": "Apache-2.0",
-  "type": "module",
-  "main": "./dist/src/index.js",
-  "types": "./dist/src/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/src/index.d.ts",
-      "import": "./dist/src/index.js"
-    }
-  },
-  "files": [
-    "dist/src",
-    "README.md"
-  ],
-  "sideEffects": false,
-  "engines": {
-    "node": ">=18"
-  },
+  "version": "0.2.0",
+  "description": "WHATWG HTML tokenizer (html5lib-tests conformant), tree builder, serializer, text extraction, allowlist sanitizer, CSS selector subset, meta and table extraction with identical results in TypeScript, Rust, Python, Go and PHP. No dependencies. Part of the Lombok Ecosystem.",
   "keywords": [
     "html",
     "parser",
+    "tokenizer",
+    "whatwg",
     "sanitizer",
-    "xss",
-    "dom",
-    "selector",
-    "scraping"
+    "css-selector",
+    "html-to-text",
+    "zero-dependency",
+    "lombok-ecosystem"
   ],
+  "homepage": "https://github.com/codinglombok/LombokHTML",
+  "bugs": {
+    "url": "https://github.com/codinglombok/LombokHTML/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "codinglombok",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/codinglombok/LombokHTML.git",
+    "url": "https://github.com/codinglombok/LombokHTML.git",
     "directory": "typescript"
   },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/*.js",
+    "dist/*.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/vectors.test.js"
+    "build:test": "tsc -p tsconfig.test.json",
+    "test": "npm run build:test && cd build && node --test",
+    "coverage": "npm run build:test && node scripts/coverage.mjs build",
+    "lint": "tsc -p tsconfig.test.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3"
   }
 }
