@@ -1,13 +1,15 @@
 [package]
 name = "lombokhtml"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Zero-dependency HTML ingestion: error-tolerant HTML5-subset parser, DOM tree, tag stripping, sanitizer, CSS selector query, meta/table extraction."
-keywords = ["html","parser","sanitizer","dom","no-std"]
+description = "WHATWG HTML tokenizer (html5lib-tests conformant), tree builder, serializer, text extraction, allowlist sanitizer, CSS selector subset, meta and table extraction with identical results in Rust, TypeScript, Python, Go and PHP. No dependencies."
+keywords = ["html","parser","tokenizer","sanitizer","no-std"]
 categories = ["parser-implementations","no-std","web-programming"]
-rust-version = "1.75"
+rust-version = "1.70"
 repository = "https://github.com/codinglombok/LombokHTML"
+readme = "README.md"
+include = ["src/**", "tests/**", "README.md", "LICENSE"]
 
 [lib]
 name = "lombokhtml"

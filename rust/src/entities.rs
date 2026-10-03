@@ -1,108 +1,144 @@
-//! HTML character-reference decoding and escaping.
-//!
-//! Decodes numeric (`&#38;`, `&#x26;`) and a curated set of named references.
-//! Unknown named references are left untouched (fail-safe, never panics).
-//! Invalid code points (0, surrogates, > U+10FFFF) become U+FFFD.
+//! Character references and escaping (SPEC section 3).
 
+use crate::entities_data::ENTITIES;
 use alloc::string::String;
 
-const NAMED: &[(&str, char)] = &[
-    ("amp", '&'),
-    ("lt", '<'),
-    ("gt", '>'),
-    ("quot", '"'),
-    ("apos", '\''),
-    ("nbsp", '\u{00A0}'),
-    ("copy", '\u{00A9}'),
-    ("reg", '\u{00AE}'),
-    ("trade", '\u{2122}'),
-    ("hellip", '\u{2026}'),
-    ("mdash", '\u{2014}'),
-    ("ndash", '\u{2013}'),
-    ("lsquo", '\u{2018}'),
-    ("rsquo", '\u{2019}'),
-    ("ldquo", '\u{201C}'),
-    ("rdquo", '\u{201D}'),
-    ("laquo", '\u{00AB}'),
-    ("raquo", '\u{00BB}'),
-    ("bull", '\u{2022}'),
-    ("middot", '\u{00B7}'),
-    ("euro", '\u{20AC}'),
-    ("pound", '\u{00A3}'),
-    ("yen", '\u{00A5}'),
-    ("cent", '\u{00A2}'),
-    ("times", '\u{00D7}'),
-    ("divide", '\u{00F7}'),
-    ("deg", '\u{00B0}'),
-    ("plusmn", '\u{00B1}'),
-    ("sect", '\u{00A7}'),
-    ("para", '\u{00B6}'),
-];
+/// Longest named reference, in characters, including the trailing `;`.
+pub(crate) const MAX_ENTITY: usize = 32;
 
-fn numeric(body: &str) -> Option<char> {
-    let (digits, radix) = match body.strip_prefix(['x', 'X']) {
-        Some(h) => (h, 16),
-        None => (body, 10),
-    };
-    // Strictly digits of the radix: `from_str_radix` alone would also accept a
-    // leading '+', which browsers and the HTML spec do not.
-    if digits.is_empty() || digits.len() > 8 || !digits.chars().all(|c| c.is_digit(radix)) {
-        return None;
-    }
-    let n = u32::from_str_radix(digits, radix).ok()?;
-    Some(
-        char::from_u32(n)
-            .filter(|c| *c != '\0')
-            .unwrap_or('\u{FFFD}'),
-    )
+/// Replacement text for a named reference (`"amp;"`, `"amp"`), if WHATWG defines it.
+pub(crate) fn lookup_named(name: &str) -> Option<&'static str> {
+    ENTITIES
+        .binary_search_by(|(k, _)| k.cmp(&name))
+        .ok()
+        .map(|i| ENTITIES[i].1)
 }
 
-/// Decode character references in `s`.
-pub fn decode_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return String::from(s);
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(pos) = rest.find('&') {
-        out.push_str(&rest[..pos]);
-        let after = &rest[pos + 1..];
-        // A reference is at most ~32 chars: look for ';' within a short window.
-        let window_end = after
-            .char_indices()
-            .take(34)
-            .find(|(_, c)| *c == ';')
-            .map(|(i, _)| i);
-        let decoded = window_end.and_then(|end| {
-            let body = &after[..end];
-            let ch = if let Some(num) = body.strip_prefix('#') {
-                numeric(num)
-            } else {
-                NAMED.iter().find(|(n, _)| *n == body).map(|(_, c)| *c)
-            };
-            ch.map(|c| (c, end))
-        });
-        match decoded {
-            Some((c, end)) => {
-                out.push(c);
-                rest = &after[end + 1..];
+/// Character for a numeric reference, with the WHATWG replacements for
+/// 0x80..0x9F and U+FFFD for zero, surrogates and values above U+10FFFF.
+pub(crate) fn numeric_char(code: u32) -> char {
+    let mapped = match code {
+        0x80 => 0x20AC,
+        0x82 => 0x201A,
+        0x83 => 0x0192,
+        0x84 => 0x201E,
+        0x85 => 0x2026,
+        0x86 => 0x2020,
+        0x87 => 0x2021,
+        0x88 => 0x02C6,
+        0x89 => 0x2030,
+        0x8A => 0x0160,
+        0x8B => 0x2039,
+        0x8C => 0x0152,
+        0x8E => 0x017D,
+        0x91 => 0x2018,
+        0x92 => 0x2019,
+        0x93 => 0x201C,
+        0x94 => 0x201D,
+        0x95 => 0x2022,
+        0x96 => 0x2013,
+        0x97 => 0x2014,
+        0x98 => 0x02DC,
+        0x99 => 0x2122,
+        0x9A => 0x0161,
+        0x9B => 0x203A,
+        0x9C => 0x0153,
+        0x9E => 0x017E,
+        0x9F => 0x0178,
+        0 => 0xFFFD,
+        c => c,
+    };
+    char::from_u32(mapped).unwrap_or('\u{FFFD}')
+}
+
+/// Decodes character references as in text content (SPEC section 3.1).
+pub fn decode_entities(text: &str) -> String {
+    let s: alloc::vec::Vec<char> = text.chars().collect();
+    let n = s.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < n {
+        if s[i] != '&' {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        let j = i + 1;
+        if j < n && s[j] == '#' {
+            let mut k = j + 1;
+            let hex = k < n && (s[k] == 'x' || s[k] == 'X');
+            if hex {
+                k += 1;
             }
+            let radix = if hex { 16 } else { 10 };
+            let start = k;
+            let mut code: u32 = 0;
+            while k < n {
+                match s[k].to_digit(radix) {
+                    Some(d) if s[k].is_ascii() => {
+                        code = (code * radix + d).min(0x110000);
+                        k += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if k == start {
+                out.extend(&s[i..k]);
+                i = k;
+                continue;
+            }
+            if k < n && s[k] == ';' {
+                k += 1;
+            }
+            out.push(numeric_char(code));
+            i = k;
+            continue;
+        }
+        let mut k = j;
+        while k < n && s[k].is_ascii_alphanumeric() && k - j < MAX_ENTITY {
+            k += 1;
+        }
+        let run: String = s[j..k].iter().collect();
+        let mut matched: Option<(usize, &'static str)> = None;
+        if k < n && s[k] == ';' {
+            let mut key = run.clone();
+            key.push(';');
+            if let Some(v) = lookup_named(&key) {
+                matched = Some((run.len() + 1, v));
+            }
+        }
+        if matched.is_none() {
+            let mut m = run.len();
+            while m > 0 {
+                if let Some(v) = lookup_named(&run[..m]) {
+                    matched = Some((m, v));
+                    break;
+                }
+                m -= 1;
+            }
+        }
+        match matched {
             None => {
                 out.push('&');
-                rest = after;
+                out.push_str(&run);
+                i = k;
+            }
+            Some((len, v)) => {
+                out.push_str(v);
+                i = j + len;
             }
         }
     }
-    out.push_str(rest);
     out
 }
 
-/// Escape text content for serialization.
+/// Escapes text content: `&`, U+00A0, `<`, `>` (SPEC section 3.2).
 pub fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
+            '\u{a0}' => out.push_str("&nbsp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             _ => out.push(c),
@@ -111,61 +147,18 @@ pub fn escape_text(s: &str) -> String {
     out
 }
 
-/// Escape an attribute value for double-quoted serialization.
+/// Escapes an attribute value: `&`, U+00A0, `"`, `<`, `>` (SPEC section 3.2).
 pub fn escape_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
+            '\u{a0}' => out.push_str("&nbsp;"),
+            '"' => out.push_str("&quot;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
             _ => out.push(c),
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_named_and_numeric() {
-        assert_eq!(
-            decode_entities("a &amp; b &lt;c&gt; &quot;d&quot;"),
-            "a & b <c> \"d\""
-        );
-        assert_eq!(decode_entities("&#38;&#x26;&#X41;"), "&&A");
-        assert_eq!(decode_entities("caf&eacute;"), "caf&eacute;"); // unknown: untouched
-    }
-
-    #[test]
-    fn invalid_code_points_become_replacement() {
-        assert_eq!(decode_entities("&#0;"), "\u{FFFD}");
-        assert_eq!(decode_entities("&#xD800;"), "\u{FFFD}");
-        assert_eq!(decode_entities("&#x110000;"), "\u{FFFD}");
-    }
-
-    #[test]
-    fn sign_prefixed_numbers_are_not_references() {
-        assert_eq!(decode_entities("&#+65;"), "&#+65;");
-        assert_eq!(decode_entities("&#x+41;"), "&#x+41;");
-        assert_eq!(decode_entities("&#-65;"), "&#-65;");
-    }
-
-    #[test]
-    fn malformed_is_left_alone() {
-        assert_eq!(decode_entities("AT&T"), "AT&T");
-        assert_eq!(decode_entities("&"), "&");
-        assert_eq!(decode_entities("&#;"), "&#;");
-        assert_eq!(decode_entities("&amp"), "&amp");
-    }
-
-    #[test]
-    fn escape_roundtrip() {
-        let s = "<a href=\"x\">&</a>";
-        assert_eq!(decode_entities(&escape_attr(s)), s);
-        assert_eq!(decode_entities(&escape_text(s)), s);
-    }
 }

@@ -1,13 +1,11 @@
-//! An error-tolerant HTML tokenizer covering the subset real-world HTML
-//! ingestion needs: start/end tags with attributes, comments, doctype,
-//! and text runs. Malformed markup (unquoted attributes, missing closing
-//! `>`, stray `<`) degrades gracefully rather than erroring, matching
-//! browser-parser behavior (scope item 1).
+//! WHATWG HTML tokenizer (SPEC section 2), for HTML content (no foreign content).
 
-use alloc::string::String;
+use crate::entities::{lookup_named, numeric_char, MAX_ENTITY};
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-#[derive(Debug, Clone, PartialEq)]
+/// A token. Attribute names are lowercased; duplicate attributes keep the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
     StartTag {
         name: String,
@@ -17,404 +15,1200 @@ pub enum Token {
     EndTag {
         name: String,
     },
-    Text(String),
+    /// Adjacent characters are merged into one token.
+    Character(String),
     Comment(String),
-    Doctype(String),
+    Doctype {
+        name: Option<String>,
+        public_id: Option<String>,
+        system_id: Option<String>,
+        /// False when the tokenizer set the force-quirks flag.
+        correct: bool,
+    },
 }
 
-/// Elements with no content and no end tag (HTML5 "void elements").
-pub const VOID_ELEMENTS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
-    "track", "wbr",
-];
-
-pub fn is_void_element(tag: &str) -> bool {
-    VOID_ELEMENTS.contains(&tag)
+/// Tokenizer state to start in (SPEC section 2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Data,
+    Rcdata,
+    Rawtext,
+    ScriptData,
+    Plaintext,
+    CdataSection,
 }
 
-/// Elements whose content is raw text (not further tokenized as markup).
-pub const RAW_TEXT_ELEMENTS: &[&str] = &["script", "style"];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S {
+    Data,
+    Rcdata,
+    Rawtext,
+    Script,
+    Plaintext,
+    TagOpen,
+    EndTagOpen,
+    TagName,
+    RcdataLt,
+    RcdataEndOpen,
+    RcdataEndName,
+    RawtextLt,
+    RawtextEndOpen,
+    RawtextEndName,
+    ScriptLt,
+    ScriptEndOpen,
+    ScriptEndName,
+    ScriptEscStart,
+    ScriptEscStartDash,
+    ScriptEsc,
+    ScriptEscDash,
+    ScriptEscDashDash,
+    ScriptEscLt,
+    ScriptEscEndOpen,
+    ScriptEscEndName,
+    ScriptDblEscStart,
+    ScriptDblEsc,
+    ScriptDblEscDash,
+    ScriptDblEscDashDash,
+    ScriptDblEscLt,
+    ScriptDblEscEnd,
+    BeforeAttrName,
+    AttrName,
+    AfterAttrName,
+    BeforeAttrValue,
+    AttrDq,
+    AttrSq,
+    AttrUnq,
+    AfterAttrValueQ,
+    SelfClosing,
+    BogusComment,
+    MarkupDecl,
+    CommentStart,
+    CommentStartDash,
+    Comment,
+    CommentLt,
+    CommentLtBang,
+    CommentLtBangDash,
+    CommentLtBangDashDash,
+    CommentEndDash,
+    CommentEnd,
+    CommentEndBang,
+    Doctype,
+    BeforeDoctypeName,
+    DoctypeName,
+    AfterDoctypeName,
+    AfterPublicKw,
+    BeforePublicId,
+    PublicDq,
+    PublicSq,
+    AfterPublicId,
+    BetweenIds,
+    AfterSystemKw,
+    BeforeSystemId,
+    SystemDq,
+    SystemSq,
+    AfterSystemId,
+    BogusDoctype,
+    Cdata,
+    CdataBracket,
+    CdataEnd,
+    CharRef,
+    NamedRef,
+    AmbiguousAmp,
+    NumericRef,
+    HexRefStart,
+    DecRefStart,
+    HexRef,
+    DecRef,
+    NumericRefEnd,
+}
 
-pub fn tokenize(html: &str) -> Vec<Token> {
-    let chars: Vec<char> = html.chars().collect();
-    let mut i = 0usize;
-    let mut tokens = Vec::new();
-    let mut text_buf = String::new();
+struct Tag {
+    end: bool,
+    name: String,
+    attrs: Vec<(String, String)>,
+    self_closing: bool,
+}
 
-    macro_rules! flush_text {
-        () => {
-            if !text_buf.is_empty() {
-                tokens.push(Token::Text(crate::entities::decode_entities(
-                    &core::mem::take(&mut text_buf),
-                )));
+struct Doctype {
+    name: Option<String>,
+    public_id: Option<String>,
+    system_id: Option<String>,
+    quirks: bool,
+}
+
+pub(crate) struct Tokenizer {
+    s: Vec<char>,
+    i: usize,
+    state: S,
+    ret: S,
+    last_start: Option<String>,
+    switch: bool,
+    out: Vec<Token>,
+    tag: Option<Tag>,
+    temp: String,
+    comment: String,
+    doctype: Option<Doctype>,
+    code: u32,
+}
+
+fn is_ws(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{c}' | ' ')
+}
+
+impl Tokenizer {
+    pub(crate) fn new(text: &str, state: State, last_start: Option<&str>, switch: bool) -> Self {
+        let mut s = Vec::with_capacity(text.len());
+        let mut it = text.chars().peekable();
+        while let Some(c) = it.next() {
+            if c == '\r' {
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+                s.push('\n');
+            } else {
+                s.push(c);
             }
+        }
+        let st = match state {
+            State::Data => S::Data,
+            State::Rcdata => S::Rcdata,
+            State::Rawtext => S::Rawtext,
+            State::ScriptData => S::Script,
+            State::Plaintext => S::Plaintext,
+            State::CdataSection => S::Cdata,
         };
+        Tokenizer {
+            s,
+            i: 0,
+            state: st,
+            ret: S::Data,
+            last_start: last_start.map(ToString::to_string),
+            switch,
+            out: Vec::new(),
+            tag: None,
+            temp: String::new(),
+            comment: String::new(),
+            doctype: None,
+            code: 0,
+        }
     }
 
-    while i < chars.len() {
-        if chars[i] == '<' {
-            // Comment
-            if chars[i..].starts_with(&['<', '!', '-', '-']) {
-                flush_text!();
-                let start = i + 4;
-                let mut end = start;
-                while end < chars.len() && !chars[end..].starts_with(&['-', '-', '>']) {
-                    end += 1;
-                }
-                let content: String = chars[start..end].iter().collect();
-                tokens.push(Token::Comment(content));
-                i = if end < chars.len() {
-                    end + 3
-                } else {
-                    chars.len()
-                };
-                continue;
-            }
-            // Doctype
-            if chars[i..].to_ascii_lowercase_prefix(9) == "<!doctype" {
-                flush_text!();
-                let start = i;
-                let mut end = start;
-                while end < chars.len() && chars[end] != '>' {
-                    end += 1;
-                }
-                let content: String = chars[start..(end.min(chars.len()))].iter().collect();
-                tokens.push(Token::Doctype(content));
-                i = if end < chars.len() {
-                    end + 1
-                } else {
-                    chars.len()
-                };
-                continue;
-            }
-            // End tag
-            if chars.get(i + 1) == Some(&'/') {
-                flush_text!();
-                let mut end = i + 2;
-                while end < chars.len() && chars[end] != '>' {
-                    end += 1;
-                }
-                let name: String = chars[i + 2..end.min(chars.len())]
-                    .iter()
-                    .collect::<String>()
-                    .trim()
-                    .to_ascii_lowercase();
-                if !name.is_empty() {
-                    tokens.push(Token::EndTag { name: name.clone() });
-                }
-                i = if end < chars.len() {
-                    end + 1
-                } else {
-                    chars.len()
-                };
+    fn emit_str(&mut self, s: &str) {
+        if let Some(Token::Character(last)) = self.out.last_mut() {
+            last.push_str(s);
+        } else {
+            self.out.push(Token::Character(s.to_string()));
+        }
+    }
 
-                // Raw-text elements: nothing to skip here (handled after
-                // the matching start tag below), but if content ever
-                // slips through unbalanced we simply continue.
-                continue;
-            }
-            // Start tag (must begin with an ASCII letter after '<')
-            if chars.get(i + 1).map(|c| c.is_ascii_alphabetic()) == Some(true) {
-                flush_text!();
-                let tag_start = i + 1;
-                let end = find_tag_end(&chars, tag_start);
-                let raw: String = chars[tag_start..end.min(chars.len())].iter().collect();
-                let (name, attrs, self_closing) = parse_tag_contents(&raw);
-                let is_raw_text = RAW_TEXT_ELEMENTS.contains(&name.as_str());
-                tokens.push(Token::StartTag {
-                    name: name.clone(),
-                    attrs,
-                    self_closing,
-                });
-                i = if end < chars.len() {
-                    end + 1
-                } else {
-                    chars.len()
-                };
+    fn emit_char(&mut self, c: char) {
+        if let Some(Token::Character(last)) = self.out.last_mut() {
+            last.push(c);
+        } else {
+            self.out.push(Token::Character(c.to_string()));
+        }
+    }
 
-                if is_raw_text && !self_closing {
-                    // Consume everything up to (and including) the
-                    // matching </name>, verbatim, as a single Text token.
-                    let close_pat: Vec<char> = alloc::format!("</{}", name).chars().collect();
-                    let mut j = i;
-                    let mut found_close = None;
-                    while j < chars.len() {
-                        if chars[j..].starts_with(close_pat.as_slice()) {
-                            found_close = Some(j);
+    fn new_tag(&mut self, end: bool) {
+        self.tag = Some(Tag {
+            end,
+            name: String::new(),
+            attrs: Vec::new(),
+            self_closing: false,
+        });
+    }
+
+    fn tag(&mut self) -> &mut Tag {
+        self.tag.as_mut().expect("tag")
+    }
+
+    fn emit_tag(&mut self) {
+        let t = self.tag.take().expect("tag");
+        if t.end {
+            self.out.push(Token::EndTag { name: t.name });
+            return;
+        }
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        for (k, v) in t.attrs {
+            if !attrs.iter().any(|(a, _)| *a == k) {
+                attrs.push((k, v));
+            }
+        }
+        if self.switch {
+            self.state = match t.name.as_str() {
+                "title" | "textarea" => S::Rcdata,
+                "style" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript" => S::Rawtext,
+                "script" => S::Script,
+                "plaintext" => S::Plaintext,
+                _ => self.state,
+            };
+        }
+        self.last_start = Some(t.name.clone());
+        self.out.push(Token::StartTag {
+            name: t.name,
+            attrs,
+            self_closing: t.self_closing,
+        });
+    }
+
+    fn appropriate(&self) -> bool {
+        match (&self.tag, &self.last_start) {
+            (Some(t), Some(l)) => t.end && t.name == *l,
+            _ => false,
+        }
+    }
+
+    fn start_attr(&mut self) {
+        self.tag().attrs.push((String::new(), String::new()));
+    }
+
+    fn attr_name(&mut self) -> &mut String {
+        &mut self.tag().attrs.last_mut().expect("attr").0
+    }
+
+    fn attr_value(&mut self) -> &mut String {
+        &mut self.tag().attrs.last_mut().expect("attr").1
+    }
+
+    fn in_attr(&self) -> bool {
+        matches!(self.ret, S::AttrDq | S::AttrSq | S::AttrUnq)
+    }
+
+    fn flush_ref(&mut self) {
+        let t = core::mem::take(&mut self.temp);
+        if self.in_attr() {
+            self.attr_value().push_str(&t);
+        } else {
+            self.emit_str(&t);
+        }
+    }
+
+    fn reconsume(&mut self, st: S) {
+        self.i -= 1;
+        self.state = st;
+    }
+
+    fn emit_comment(&mut self) {
+        let c = core::mem::take(&mut self.comment);
+        self.out.push(Token::Comment(c));
+    }
+
+    fn new_doctype(&mut self) {
+        self.doctype = Some(Doctype {
+            name: None,
+            public_id: None,
+            system_id: None,
+            quirks: false,
+        });
+    }
+
+    fn doctype(&mut self) -> &mut Doctype {
+        self.doctype.as_mut().expect("doctype")
+    }
+
+    fn emit_doctype(&mut self, quirks: bool) {
+        let d = self.doctype.take().expect("doctype");
+        self.out.push(Token::Doctype {
+            name: d.name,
+            public_id: d.public_id,
+            system_id: d.system_id,
+            correct: !(d.quirks || quirks),
+        });
+    }
+
+    fn lower(c: char) -> char {
+        c.to_ascii_lowercase()
+    }
+
+    fn peek_eq(&self, word: &str, ignore_case: bool) -> bool {
+        let w: Vec<char> = word.chars().collect();
+        if self.i + w.len() > self.s.len() {
+            return false;
+        }
+        self.s[self.i..self.i + w.len()]
+            .iter()
+            .zip(w.iter())
+            .all(|(a, b)| {
+                if ignore_case {
+                    a.eq_ignore_ascii_case(b)
+                } else {
+                    a == b
+                }
+            })
+    }
+
+    pub(crate) fn run(mut self) -> Vec<Token> {
+        loop {
+            let c = self.s.get(self.i).copied();
+            self.i += 1;
+            if !self.step(c) {
+                break;
+            }
+        }
+        self.out
+    }
+
+    #[allow(clippy::cognitive_complexity)]
+    fn step(&mut self, c: Option<char>) -> bool {
+        use S::*;
+        match self.state {
+            Data => match c {
+                Some('&') => {
+                    self.ret = Data;
+                    self.state = CharRef;
+                }
+                Some('<') => self.state = TagOpen,
+                None => return false,
+                Some(ch) => self.emit_char(ch),
+            },
+            Rcdata => match c {
+                Some('&') => {
+                    self.ret = Rcdata;
+                    self.state = CharRef;
+                }
+                Some('<') => self.state = RcdataLt,
+                Some('\0') => self.emit_char('\u{fffd}'),
+                None => return false,
+                Some(ch) => self.emit_char(ch),
+            },
+            Rawtext | Script | Plaintext => {
+                let lt = match self.state {
+                    Rawtext => Some(RawtextLt),
+                    Script => Some(ScriptLt),
+                    _ => None,
+                };
+                match c {
+                    Some('<') if lt.is_some() => self.state = lt.expect("lt"),
+                    Some('\0') => self.emit_char('\u{fffd}'),
+                    None => return false,
+                    Some(ch) => self.emit_char(ch),
+                }
+            }
+            TagOpen => match c {
+                Some('!') => self.state = MarkupDecl,
+                Some('/') => self.state = EndTagOpen,
+                Some(ch) if ch.is_ascii_alphabetic() => {
+                    self.new_tag(false);
+                    self.reconsume(TagName);
+                }
+                Some('?') => {
+                    self.comment.clear();
+                    self.reconsume(BogusComment);
+                }
+                None => {
+                    self.emit_char('<');
+                    return false;
+                }
+                Some(_) => {
+                    self.emit_char('<');
+                    self.reconsume(Data);
+                }
+            },
+            EndTagOpen => match c {
+                Some(ch) if ch.is_ascii_alphabetic() => {
+                    self.new_tag(true);
+                    self.reconsume(TagName);
+                }
+                Some('>') => self.state = Data,
+                None => {
+                    self.emit_str("</");
+                    return false;
+                }
+                Some(_) => {
+                    self.comment.clear();
+                    self.reconsume(BogusComment);
+                }
+            },
+            TagName => match c {
+                Some(ch) if is_ws(ch) => self.state = BeforeAttrName,
+                Some('/') => self.state = SelfClosing,
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_tag();
+                }
+                Some('\0') => self.tag().name.push('\u{fffd}'),
+                None => return false,
+                Some(ch) => self.tag().name.push(Self::lower(ch)),
+            },
+            RcdataLt => self.lt(c, Rcdata, RcdataEndOpen),
+            RcdataEndOpen => self.end_open(c, Rcdata, RcdataEndName),
+            RcdataEndName => self.end_name(c, Rcdata),
+            RawtextLt => self.lt(c, Rawtext, RawtextEndOpen),
+            RawtextEndOpen => self.end_open(c, Rawtext, RawtextEndName),
+            RawtextEndName => self.end_name(c, Rawtext),
+            ScriptLt => match c {
+                Some('/') => {
+                    self.temp.clear();
+                    self.state = ScriptEndOpen;
+                }
+                Some('!') => {
+                    self.state = ScriptEscStart;
+                    self.emit_str("<!");
+                }
+                _ => {
+                    self.emit_char('<');
+                    self.reconsume(Script);
+                }
+            },
+            ScriptEndOpen => self.end_open(c, Script, ScriptEndName),
+            ScriptEndName => self.end_name(c, Script),
+            ScriptEscStart => match c {
+                Some('-') => {
+                    self.state = ScriptEscStartDash;
+                    self.emit_char('-');
+                }
+                _ => self.reconsume(Script),
+            },
+            ScriptEscStartDash => match c {
+                Some('-') => {
+                    self.state = ScriptEscDashDash;
+                    self.emit_char('-');
+                }
+                _ => self.reconsume(Script),
+            },
+            ScriptEsc => match c {
+                Some('-') => {
+                    self.state = ScriptEscDash;
+                    self.emit_char('-');
+                }
+                Some('<') => self.state = ScriptEscLt,
+                Some('\0') => self.emit_char('\u{fffd}'),
+                None => return false,
+                Some(ch) => self.emit_char(ch),
+            },
+            ScriptEscDash => match c {
+                Some('-') => {
+                    self.state = ScriptEscDashDash;
+                    self.emit_char('-');
+                }
+                Some('<') => self.state = ScriptEscLt,
+                Some('\0') => {
+                    self.state = ScriptEsc;
+                    self.emit_char('\u{fffd}');
+                }
+                None => return false,
+                Some(ch) => {
+                    self.state = ScriptEsc;
+                    self.emit_char(ch);
+                }
+            },
+            ScriptEscDashDash => match c {
+                Some('-') => self.emit_char('-'),
+                Some('<') => self.state = ScriptEscLt,
+                Some('>') => {
+                    self.state = Script;
+                    self.emit_char('>');
+                }
+                Some('\0') => {
+                    self.state = ScriptEsc;
+                    self.emit_char('\u{fffd}');
+                }
+                None => return false,
+                Some(ch) => {
+                    self.state = ScriptEsc;
+                    self.emit_char(ch);
+                }
+            },
+            ScriptEscLt => match c {
+                Some('/') => {
+                    self.temp.clear();
+                    self.state = ScriptEscEndOpen;
+                }
+                Some(ch) if ch.is_ascii_alphabetic() => {
+                    self.temp.clear();
+                    self.emit_char('<');
+                    self.reconsume(ScriptDblEscStart);
+                }
+                _ => {
+                    self.emit_char('<');
+                    self.reconsume(ScriptEsc);
+                }
+            },
+            ScriptEscEndOpen => self.end_open(c, ScriptEsc, ScriptEscEndName),
+            ScriptEscEndName => self.end_name(c, ScriptEsc),
+            ScriptDblEscStart | ScriptDblEscEnd => {
+                let start = self.state == ScriptDblEscStart;
+                match c {
+                    Some(ch) if is_ws(ch) || ch == '/' || ch == '>' => {
+                        let is_script = self.temp == "script";
+                        self.state = match (start, is_script) {
+                            (true, true) | (false, false) => ScriptDblEsc,
+                            _ => ScriptEsc,
+                        };
+                        self.emit_char(ch);
+                    }
+                    Some(ch) if ch.is_ascii_alphabetic() => {
+                        self.temp.push(Self::lower(ch));
+                        self.emit_char(ch);
+                    }
+                    _ => self.reconsume(if start { ScriptEsc } else { ScriptDblEsc }),
+                }
+            }
+            ScriptDblEsc => match c {
+                Some('-') => {
+                    self.state = ScriptDblEscDash;
+                    self.emit_char('-');
+                }
+                Some('<') => {
+                    self.state = ScriptDblEscLt;
+                    self.emit_char('<');
+                }
+                Some('\0') => self.emit_char('\u{fffd}'),
+                None => return false,
+                Some(ch) => self.emit_char(ch),
+            },
+            ScriptDblEscDash => match c {
+                Some('-') => {
+                    self.state = ScriptDblEscDashDash;
+                    self.emit_char('-');
+                }
+                Some('<') => {
+                    self.state = ScriptDblEscLt;
+                    self.emit_char('<');
+                }
+                Some('\0') => {
+                    self.state = ScriptDblEsc;
+                    self.emit_char('\u{fffd}');
+                }
+                None => return false,
+                Some(ch) => {
+                    self.state = ScriptDblEsc;
+                    self.emit_char(ch);
+                }
+            },
+            ScriptDblEscDashDash => match c {
+                Some('-') => self.emit_char('-'),
+                Some('<') => {
+                    self.state = ScriptDblEscLt;
+                    self.emit_char('<');
+                }
+                Some('>') => {
+                    self.state = Script;
+                    self.emit_char('>');
+                }
+                Some('\0') => {
+                    self.state = ScriptDblEsc;
+                    self.emit_char('\u{fffd}');
+                }
+                None => return false,
+                Some(ch) => {
+                    self.state = ScriptDblEsc;
+                    self.emit_char(ch);
+                }
+            },
+            ScriptDblEscLt => match c {
+                Some('/') => {
+                    self.temp.clear();
+                    self.state = ScriptDblEscEnd;
+                    self.emit_char('/');
+                }
+                _ => self.reconsume(ScriptDblEsc),
+            },
+            BeforeAttrName => match c {
+                Some(ch) if is_ws(ch) => {}
+                None | Some('/') | Some('>') => self.reconsume(AfterAttrName),
+                Some('=') => {
+                    self.start_attr();
+                    self.attr_name().push('=');
+                    self.state = AttrName;
+                }
+                Some(_) => {
+                    self.start_attr();
+                    self.reconsume(AttrName);
+                }
+            },
+            AttrName => match c {
+                None | Some('/') | Some('>') => self.reconsume(AfterAttrName),
+                Some(ch) if is_ws(ch) => self.reconsume(AfterAttrName),
+                Some('=') => self.state = BeforeAttrValue,
+                Some('\0') => self.attr_name().push('\u{fffd}'),
+                Some(ch) => self.attr_name().push(Self::lower(ch)),
+            },
+            AfterAttrName => match c {
+                Some(ch) if is_ws(ch) => {}
+                Some('/') => self.state = SelfClosing,
+                Some('=') => self.state = BeforeAttrValue,
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_tag();
+                }
+                None => return false,
+                Some(_) => {
+                    self.start_attr();
+                    self.reconsume(AttrName);
+                }
+            },
+            BeforeAttrValue => match c {
+                Some(ch) if is_ws(ch) => {}
+                Some('"') => self.state = AttrDq,
+                Some('\'') => self.state = AttrSq,
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_tag();
+                }
+                _ => self.reconsume(AttrUnq),
+            },
+            AttrDq | AttrSq => {
+                let q = if self.state == AttrDq { '"' } else { '\'' };
+                match c {
+                    Some(ch) if ch == q => self.state = AfterAttrValueQ,
+                    Some('&') => {
+                        self.ret = self.state;
+                        self.state = CharRef;
+                    }
+                    Some('\0') => self.attr_value().push('\u{fffd}'),
+                    None => return false,
+                    Some(ch) => self.attr_value().push(ch),
+                }
+            }
+            AttrUnq => match c {
+                Some(ch) if is_ws(ch) => self.state = BeforeAttrName,
+                Some('&') => {
+                    self.ret = AttrUnq;
+                    self.state = CharRef;
+                }
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_tag();
+                }
+                Some('\0') => self.attr_value().push('\u{fffd}'),
+                None => return false,
+                Some(ch) => self.attr_value().push(ch),
+            },
+            AfterAttrValueQ => match c {
+                Some(ch) if is_ws(ch) => self.state = BeforeAttrName,
+                Some('/') => self.state = SelfClosing,
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_tag();
+                }
+                None => return false,
+                Some(_) => self.reconsume(BeforeAttrName),
+            },
+            SelfClosing => match c {
+                Some('>') => {
+                    self.tag().self_closing = true;
+                    self.state = Data;
+                    self.emit_tag();
+                }
+                None => return false,
+                Some(_) => self.reconsume(BeforeAttrName),
+            },
+            BogusComment => match c {
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_comment();
+                }
+                None => {
+                    self.emit_comment();
+                    return false;
+                }
+                Some('\0') => self.comment.push('\u{fffd}'),
+                Some(ch) => self.comment.push(ch),
+            },
+            MarkupDecl => {
+                self.i -= 1;
+                self.comment.clear();
+                if self.peek_eq("--", false) {
+                    self.i += 2;
+                    self.state = CommentStart;
+                } else if self.peek_eq("doctype", true) {
+                    self.i += 7;
+                    self.state = Doctype;
+                } else {
+                    self.state = BogusComment;
+                }
+            }
+            CommentStart => match c {
+                Some('-') => self.state = CommentStartDash,
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_comment();
+                }
+                _ => self.reconsume(Comment),
+            },
+            CommentStartDash => match c {
+                Some('-') => self.state = CommentEnd,
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_comment();
+                }
+                None => {
+                    self.emit_comment();
+                    return false;
+                }
+                Some(_) => {
+                    self.comment.push('-');
+                    self.reconsume(Comment);
+                }
+            },
+            Comment => match c {
+                Some('<') => {
+                    self.comment.push('<');
+                    self.state = CommentLt;
+                }
+                Some('-') => self.state = CommentEndDash,
+                Some('\0') => self.comment.push('\u{fffd}'),
+                None => {
+                    self.emit_comment();
+                    return false;
+                }
+                Some(ch) => self.comment.push(ch),
+            },
+            CommentLt => match c {
+                Some('!') => {
+                    self.comment.push('!');
+                    self.state = CommentLtBang;
+                }
+                Some('<') => self.comment.push('<'),
+                _ => self.reconsume(Comment),
+            },
+            CommentLtBang => match c {
+                Some('-') => self.state = CommentLtBangDash,
+                _ => self.reconsume(Comment),
+            },
+            CommentLtBangDash => match c {
+                Some('-') => self.state = CommentLtBangDashDash,
+                _ => self.reconsume(CommentEndDash),
+            },
+            CommentLtBangDashDash => self.reconsume(CommentEnd),
+            CommentEndDash => match c {
+                Some('-') => self.state = CommentEnd,
+                None => {
+                    self.emit_comment();
+                    return false;
+                }
+                Some(_) => {
+                    self.comment.push('-');
+                    self.reconsume(Comment);
+                }
+            },
+            CommentEnd => match c {
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_comment();
+                }
+                Some('!') => self.state = CommentEndBang,
+                Some('-') => self.comment.push('-'),
+                None => {
+                    self.emit_comment();
+                    return false;
+                }
+                Some(_) => {
+                    self.comment.push_str("--");
+                    self.reconsume(Comment);
+                }
+            },
+            CommentEndBang => match c {
+                Some('-') => {
+                    self.comment.push_str("--!");
+                    self.state = CommentEndDash;
+                }
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_comment();
+                }
+                None => {
+                    self.emit_comment();
+                    return false;
+                }
+                Some(_) => {
+                    self.comment.push_str("--!");
+                    self.reconsume(Comment);
+                }
+            },
+            Doctype => match c {
+                Some(ch) if is_ws(ch) => self.state = BeforeDoctypeName,
+                None => {
+                    self.new_doctype();
+                    self.emit_doctype(true);
+                    return false;
+                }
+                Some(_) => self.reconsume(BeforeDoctypeName),
+            },
+            BeforeDoctypeName => match c {
+                Some(ch) if is_ws(ch) => {}
+                Some('>') => {
+                    self.new_doctype();
+                    self.state = Data;
+                    self.emit_doctype(true);
+                }
+                None => {
+                    self.new_doctype();
+                    self.emit_doctype(true);
+                    return false;
+                }
+                Some(ch) => {
+                    self.new_doctype();
+                    let first = if ch == '\0' {
+                        '\u{fffd}'
+                    } else {
+                        Self::lower(ch)
+                    };
+                    self.doctype().name = Some(first.to_string());
+                    self.state = DoctypeName;
+                }
+            },
+            DoctypeName => match c {
+                Some(ch) if is_ws(ch) => self.state = AfterDoctypeName,
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_doctype(false);
+                }
+                None => {
+                    self.emit_doctype(true);
+                    return false;
+                }
+                Some(ch) => {
+                    let ch = if ch == '\0' {
+                        '\u{fffd}'
+                    } else {
+                        Self::lower(ch)
+                    };
+                    self.doctype().name.as_mut().expect("name").push(ch);
+                }
+            },
+            AfterDoctypeName => match c {
+                Some(ch) if is_ws(ch) => {}
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_doctype(false);
+                }
+                None => {
+                    self.emit_doctype(true);
+                    return false;
+                }
+                Some(_) => {
+                    self.i -= 1;
+                    if self.peek_eq("public", true) {
+                        self.i += 6;
+                        self.state = AfterPublicKw;
+                    } else if self.peek_eq("system", true) {
+                        self.i += 6;
+                        self.state = AfterSystemKw;
+                    } else {
+                        self.i += 1;
+                        self.doctype().quirks = true;
+                        self.state = BogusDoctype;
+                    }
+                }
+            },
+            AfterPublicKw | AfterSystemKw | BeforePublicId | BeforeSystemId => {
+                let public = matches!(self.state, AfterPublicKw | BeforePublicId);
+                let after_kw = matches!(self.state, AfterPublicKw | AfterSystemKw);
+                match c {
+                    Some(ch) if is_ws(ch) => {
+                        if after_kw {
+                            self.state = if public {
+                                BeforePublicId
+                            } else {
+                                BeforeSystemId
+                            };
+                        }
+                    }
+                    Some(q @ ('"' | '\'')) => {
+                        if public {
+                            self.doctype().public_id = Some(String::new());
+                            self.state = if q == '"' { PublicDq } else { PublicSq };
+                        } else {
+                            self.doctype().system_id = Some(String::new());
+                            self.state = if q == '"' { SystemDq } else { SystemSq };
+                        }
+                    }
+                    Some('>') => {
+                        self.state = Data;
+                        self.emit_doctype(true);
+                    }
+                    None => {
+                        self.emit_doctype(true);
+                        return false;
+                    }
+                    Some(_) => {
+                        self.doctype().quirks = true;
+                        self.reconsume(BogusDoctype);
+                    }
+                }
+            }
+            PublicDq | PublicSq | SystemDq | SystemSq => {
+                let public = matches!(self.state, PublicDq | PublicSq);
+                let q = if matches!(self.state, PublicDq | SystemDq) {
+                    '"'
+                } else {
+                    '\''
+                };
+                match c {
+                    Some(ch) if ch == q => {
+                        self.state = if public { AfterPublicId } else { AfterSystemId }
+                    }
+                    Some('>') => {
+                        self.state = Data;
+                        self.emit_doctype(true);
+                    }
+                    None => {
+                        self.emit_doctype(true);
+                        return false;
+                    }
+                    Some(ch) => {
+                        let ch = if ch == '\0' { '\u{fffd}' } else { ch };
+                        let d = self.doctype();
+                        let field = if public {
+                            &mut d.public_id
+                        } else {
+                            &mut d.system_id
+                        };
+                        field.as_mut().expect("id").push(ch);
+                    }
+                }
+            }
+            AfterPublicId | BetweenIds => match c {
+                Some(ch) if is_ws(ch) => {
+                    if self.state == AfterPublicId {
+                        self.state = BetweenIds;
+                    }
+                }
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_doctype(false);
+                }
+                Some(q @ ('"' | '\'')) => {
+                    self.doctype().system_id = Some(String::new());
+                    self.state = if q == '"' { SystemDq } else { SystemSq };
+                }
+                None => {
+                    self.emit_doctype(true);
+                    return false;
+                }
+                Some(_) => {
+                    self.doctype().quirks = true;
+                    self.reconsume(BogusDoctype);
+                }
+            },
+            AfterSystemId => match c {
+                Some(ch) if is_ws(ch) => {}
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_doctype(false);
+                }
+                None => {
+                    self.emit_doctype(true);
+                    return false;
+                }
+                Some(_) => self.reconsume(BogusDoctype),
+            },
+            BogusDoctype => match c {
+                Some('>') => {
+                    self.state = Data;
+                    self.emit_doctype(false);
+                }
+                None => {
+                    self.emit_doctype(false);
+                    return false;
+                }
+                Some(_) => {}
+            },
+            Cdata => match c {
+                Some(']') => self.state = CdataBracket,
+                None => return false,
+                Some(ch) => self.emit_char(ch),
+            },
+            CdataBracket => match c {
+                Some(']') => self.state = CdataEnd,
+                _ => {
+                    self.emit_char(']');
+                    self.reconsume(Cdata);
+                }
+            },
+            CdataEnd => match c {
+                Some(']') => self.emit_char(']'),
+                Some('>') => self.state = Data,
+                _ => {
+                    self.emit_str("]]");
+                    self.reconsume(Cdata);
+                }
+            },
+            CharRef => {
+                self.temp.clear();
+                self.temp.push('&');
+                match c {
+                    Some(ch) if ch.is_ascii_alphanumeric() => self.reconsume(NamedRef),
+                    Some('#') => {
+                        self.temp.push('#');
+                        self.state = NumericRef;
+                    }
+                    _ => {
+                        self.flush_ref();
+                        let r = self.ret;
+                        self.reconsume(r);
+                    }
+                }
+            }
+            NamedRef => {
+                self.i -= 1;
+                let start = self.i;
+                let mut j = start;
+                while j < self.s.len()
+                    && self.s[j].is_ascii_alphanumeric()
+                    && j - start < MAX_ENTITY
+                {
+                    j += 1;
+                }
+                let run: String = self.s[start..j].iter().collect();
+                let semi = self.s.get(j) == Some(&';');
+                let mut matched: Option<(usize, &'static str, bool)> = None;
+                if semi {
+                    let mut key = run.clone();
+                    key.push(';');
+                    if let Some(v) = lookup_named(&key) {
+                        matched = Some((run.len() + 1, v, true));
+                    }
+                }
+                if matched.is_none() {
+                    for k in (1..=run.len()).rev() {
+                        if let Some(v) = lookup_named(&run[..k]) {
+                            matched = Some((k, v, false));
                             break;
                         }
-                        j += 1;
                     }
-                    let content_end = found_close.unwrap_or(chars.len());
-                    let raw_content: String = chars[i..content_end].iter().collect();
-                    if !raw_content.is_empty() {
-                        tokens.push(Token::Text(raw_content));
+                }
+                match matched {
+                    None => {
+                        self.temp.push_str(&run);
+                        self.i = j;
+                        self.flush_ref();
+                        self.state = AmbiguousAmp;
                     }
-                    if let Some(close_start) = found_close {
-                        let mut k = close_start;
-                        while k < chars.len() && chars[k] != '>' {
-                            k += 1;
+                    Some((len, value, with_semi)) => {
+                        self.i = start + len;
+                        let next = self.s.get(self.i).copied();
+                        if self.in_attr()
+                            && !with_semi
+                            && next.is_some_and(|n| n == '=' || n.is_ascii_alphanumeric())
+                        {
+                            self.temp.push_str(&run[..len]);
+                        } else {
+                            self.temp.clear();
+                            self.temp.push_str(value);
                         }
-                        tokens.push(Token::EndTag { name });
-                        i = if k < chars.len() { k + 1 } else { chars.len() };
+                        self.flush_ref();
+                        self.state = self.ret;
+                    }
+                }
+            }
+            AmbiguousAmp => match c {
+                Some(ch) if ch.is_ascii_alphanumeric() => {
+                    if self.in_attr() {
+                        self.attr_value().push(ch);
                     } else {
-                        i = chars.len();
+                        self.emit_char(ch);
                     }
                 }
-                continue;
-            }
-            // Stray '<' not starting a recognizable construct: literal text.
-            text_buf.push('<');
-            i += 1;
-            continue;
-        }
-        text_buf.push(chars[i]);
-        i += 1;
-    }
-    flush_text!();
-    tokens
-}
-
-/// Index of the `>` that closes a start tag beginning at `from`, ignoring any
-/// `>` inside a quoted attribute value (`<a title="a>b">`) exactly like a
-/// browser does. Returns `chars.len()` if the tag never closes.
-fn find_tag_end(chars: &[char], from: usize) -> usize {
-    let mut i = from;
-    let mut quote: Option<char> = None;
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
+                _ => {
+                    let r = self.ret;
+                    self.reconsume(r);
+                }
+            },
+            NumericRef => {
+                self.code = 0;
+                match c {
+                    Some(ch @ ('x' | 'X')) => {
+                        self.temp.push(ch);
+                        self.state = HexRefStart;
+                    }
+                    _ => self.reconsume(DecRefStart),
                 }
             }
-            None => {
-                if c == '>' {
-                    return i;
-                }
-                if c == '=' {
-                    let mut j = i + 1;
-                    while j < chars.len() && chars[j].is_whitespace() {
-                        j += 1;
+            HexRefStart | DecRefStart => {
+                let hex = self.state == HexRefStart;
+                let ok = c.is_some_and(|ch| {
+                    if hex {
+                        ch.is_ascii_hexdigit()
+                    } else {
+                        ch.is_ascii_digit()
                     }
-                    if let Some(&q) = chars.get(j) {
-                        if q == '"' || q == '\'' {
-                            quote = Some(q);
-                            i = j;
-                        }
-                    }
-                }
-            }
-        }
-        i += 1;
-    }
-    chars.len()
-}
-
-/// Parse `tag attr="val" attr2='val2' attr3 checked/` (without the
-/// enclosing `<`/`>`) into (name, attrs, self_closing).
-fn parse_tag_contents(raw: &str) -> (String, Vec<(String, String)>, bool) {
-    let chars: Vec<char> = raw.chars().collect();
-    let mut i = 0;
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    let name_start = i;
-    while i < chars.len()
-        && (chars[i].is_ascii_alphanumeric() || chars[i] == '-' || chars[i] == ':')
-    {
-        i += 1;
-    }
-    let name: String = chars[name_start..i]
-        .iter()
-        .collect::<String>()
-        .to_ascii_lowercase();
-
-    let mut attrs = Vec::new();
-    let mut self_closing = false;
-
-    loop {
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-        if chars[i] == '/' {
-            self_closing = true;
-            i += 1;
-            continue;
-        }
-        let attr_name_start = i;
-        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '=' && chars[i] != '/' {
-            i += 1;
-        }
-        if i == attr_name_start {
-            i += 1;
-            continue;
-        }
-        let attr_name: String = chars[attr_name_start..i]
-            .iter()
-            .collect::<String>()
-            .to_ascii_lowercase();
-
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        let mut attr_value = String::new();
-        if chars.get(i) == Some(&'=') {
-            i += 1;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            if let Some(&quote) = chars.get(i) {
-                if quote == '"' || quote == '\'' {
-                    i += 1;
-                    let val_start = i;
-                    while i < chars.len() && chars[i] != quote {
-                        i += 1;
-                    }
-                    attr_value = chars[val_start..i].iter().collect();
-                    if i < chars.len() {
-                        i += 1;
-                    }
+                });
+                if ok {
+                    self.reconsume(if hex { HexRef } else { DecRef });
                 } else {
-                    let val_start = i;
-                    while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '/' {
-                        i += 1;
-                    }
-                    attr_value = chars[val_start..i].iter().collect();
+                    self.flush_ref();
+                    let r = self.ret;
+                    self.reconsume(r);
                 }
             }
-        }
-        attrs.push((attr_name, crate::entities::decode_entities(&attr_value)));
-    }
-
-    (name, attrs, self_closing)
-}
-
-/// Small helper trait used above to peek a lowercase prefix without
-/// allocating for every comparison.
-trait AsciiLowerPrefix {
-    fn to_ascii_lowercase_prefix(&self, n: usize) -> String;
-}
-impl AsciiLowerPrefix for [char] {
-    fn to_ascii_lowercase_prefix(&self, n: usize) -> String {
-        self.iter().take(n).collect::<String>().to_ascii_lowercase()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tokenizes_simple_element() {
-        let toks = tokenize("<p>Hello</p>");
-        assert_eq!(
-            toks,
-            alloc::vec![
-                Token::StartTag {
-                    name: "p".into(),
-                    attrs: alloc::vec![],
-                    self_closing: false
-                },
-                Token::Text("Hello".into()),
-                Token::EndTag { name: "p".into() },
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenizes_attributes() {
-        let toks = tokenize(r#"<a href="https://x.com" target='_blank' checked>Go</a>"#);
-        match &toks[0] {
-            Token::StartTag { name, attrs, .. } => {
-                assert_eq!(name, "a");
-                assert_eq!(attrs[0], ("href".to_string(), "https://x.com".to_string()));
-                assert_eq!(attrs[1], ("target".to_string(), "_blank".to_string()));
-                assert_eq!(attrs[2], ("checked".to_string(), "".to_string()));
+            HexRef | DecRef => {
+                let radix = if self.state == HexRef { 16 } else { 10 };
+                match c.and_then(|ch| ch.to_digit(radix)) {
+                    Some(d) => {
+                        self.code =
+                            (self.code.saturating_mul(radix).saturating_add(d)).min(0x11_0000)
+                    }
+                    None if c == Some(';') => self.state = NumericRefEnd,
+                    None => self.reconsume(NumericRefEnd),
+                }
             }
-            _ => panic!("expected start tag"),
-        }
-    }
-
-    #[test]
-    fn void_elements_have_no_end_tag() {
-        let toks = tokenize("<br><img src=\"a.png\">");
-        assert_eq!(toks.len(), 2);
-        assert!(matches!(toks[0], Token::StartTag { .. }));
-        assert!(matches!(toks[1], Token::StartTag { .. }));
-    }
-
-    #[test]
-    fn script_content_is_raw_text() {
-        let toks = tokenize("<script>if (1 < 2) { alert('<b>') }</script>after");
-        assert_eq!(
-            toks,
-            alloc::vec![
-                Token::StartTag {
-                    name: "script".into(),
-                    attrs: alloc::vec![],
-                    self_closing: false
-                },
-                Token::Text("if (1 < 2) { alert('<b>') }".into()),
-                Token::EndTag {
-                    name: "script".into()
-                },
-                Token::Text("after".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn comment_is_captured() {
-        let toks = tokenize("<!-- note --><p>x</p>");
-        assert_eq!(toks[0], Token::Comment(" note ".into()));
-    }
-
-    #[test]
-    fn doctype_is_captured() {
-        let toks = tokenize("<!DOCTYPE html><html></html>");
-        assert!(matches!(toks[0], Token::Doctype(_)));
-    }
-
-    #[test]
-    fn malformed_unclosed_tag_degrades_gracefully() {
-        // No closing '>' before EOF: swallowed as a tag with an empty/garbage
-        // name rather than panicking.
-        let toks = tokenize("<p>text<un");
-        assert!(!toks.is_empty());
-    }
-
-    #[test]
-    fn gt_inside_quoted_attribute_does_not_end_tag() {
-        let toks = tokenize(r#"<a title="x>y" href='a>b'>t</a>"#);
-        match &toks[0] {
-            Token::StartTag { attrs, .. } => {
-                assert_eq!(attrs[0].1, "x>y");
-                assert_eq!(attrs[1].1, "a>b");
+            NumericRefEnd => {
+                self.i -= 1;
+                self.temp.clear();
+                self.temp.push(numeric_char(self.code));
+                self.flush_ref();
+                self.state = self.ret;
             }
-            _ => panic!(),
         }
-        assert_eq!(toks[1], Token::Text("t".into()));
+        true
     }
 
-    #[test]
-    fn entities_decoded_in_text_and_attrs_but_not_raw_text() {
-        let toks = tokenize("<p title=\"a&amp;b\">x &lt; y</p><script>a &lt; b</script>");
-        match &toks[0] {
-            Token::StartTag { attrs, .. } => assert_eq!(attrs[0].1, "a&b"),
-            _ => panic!(),
+    fn lt(&mut self, c: Option<char>, base: S, open: S) {
+        if c == Some('/') {
+            self.temp.clear();
+            self.state = open;
+        } else {
+            self.emit_char('<');
+            self.reconsume(base);
         }
-        assert_eq!(toks[1], Token::Text("x < y".into()));
-        assert_eq!(toks[4], Token::Text("a &lt; b".into()));
     }
 
-    #[test]
-    fn stray_lt_in_text_is_literal() {
-        let toks = tokenize("5 < 10 and 20 > 10");
-        assert_eq!(toks, alloc::vec![Token::Text("5 < 10 and 20 > 10".into())]);
+    fn end_open(&mut self, c: Option<char>, base: S, name: S) {
+        if c.is_some_and(|ch| ch.is_ascii_alphabetic()) {
+            self.new_tag(true);
+            self.reconsume(name);
+        } else {
+            self.emit_str("</");
+            self.reconsume(base);
+        }
     }
+
+    fn end_name(&mut self, c: Option<char>, base: S) {
+        match c {
+            Some(ch) if is_ws(ch) && self.appropriate() => self.state = S::BeforeAttrName,
+            Some('/') if self.appropriate() => self.state = S::SelfClosing,
+            Some('>') if self.appropriate() => {
+                self.state = S::Data;
+                self.emit_tag();
+            }
+            Some(ch) if ch.is_ascii_alphabetic() => {
+                self.tag().name.push(Self::lower(ch));
+                self.temp.push(ch);
+            }
+            _ => {
+                let mut s = String::from("</");
+                s.push_str(&self.temp);
+                self.emit_str(&s);
+                self.tag = None;
+                self.reconsume(base);
+            }
+        }
+    }
+}
+
+/// Tokenizes `html` as the parser does: start tags of `title`, `textarea`,
+/// `style`, `xmp`, `iframe`, `noembed`, `noframes`, `noscript`, `script` and
+/// `plaintext` switch the tokenizer state (SPEC section 2.2).
+pub fn tokenize(html: &str) -> Vec<Token> {
+    Tokenizer::new(html, State::Data, None, true).run()
+}
+
+/// Tokenizes `html` from `state` without element-driven switching, as the
+/// html5lib tokenizer tests do; `last_start_tag` decides which end tag closes
+/// RCDATA, RAWTEXT and script data.
+pub fn tokenize_state(html: &str, state: State, last_start_tag: Option<&str>) -> Vec<Token> {
+    Tokenizer::new(html, state, last_start_tag, false).run()
 }

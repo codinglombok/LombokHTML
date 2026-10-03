@@ -1,7 +1,40 @@
-/rust/target
-/typescript/node_modules
-/typescript/dist
+# Rust
+/rust/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / TypeScript
 node_modules/
+/typescript/dist/
+/typescript/node_modules/
+/typescript/build/
+*.tsbuildinfo
+
+# Python
 __pycache__/
 *.pyc
-/docs
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Go
+/go/vendor/
+
+# PHP
+/php/vendor/
+composer.lock
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Dokumen internal (ADR-024)
+/map
+/docs/*architecture*.*
+/docs/*masterplan*.*

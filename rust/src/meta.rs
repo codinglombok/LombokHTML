@@ -1,93 +1,87 @@
-//! Meta tag extraction (scope item 7): `<title>`, `<meta name="description">`,
-//! and `og:*` Open Graph tags.
+//! Page metadata (SPEC section 9).
 
-use crate::dom::Node;
+use crate::dom::{Document, NodeKind};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Metadata found in a document.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PageMeta {
+    /// Text of the first `title` element, whitespace collapsed; `None` when absent or blank.
     pub title: Option<String>,
+    /// `content` of the first `<meta name="description">`.
     pub description: Option<String>,
-    /// `(property, content)` pairs for every `og:*` meta tag, in document order.
-    pub og_tags: Vec<(String, String)>,
+    /// `href` of the first `<link rel="canonical">`.
+    pub canonical: Option<String>,
+    /// `lang` of the first `html` element that has one.
+    pub lang: Option<String>,
+    /// `(property without "og:", content)` for every `<meta property="og:...">`, in order.
+    pub og: Vec<(String, String)>,
 }
 
-pub fn extract_meta(doc: &Node) -> PageMeta {
-    let mut meta = PageMeta::default();
-
-    if let Some(title_node) = doc.find_first("title") {
-        let mut text = String::new();
-        for c in &title_node.children {
-            if let Some(t) = &c.text {
-                text.push_str(t);
-            }
-        }
-        if !text.is_empty() {
-            meta.title = Some(text);
-        }
-    }
-
-    for m in doc.find_all("meta") {
-        if let Some(name) = m.attr("name") {
-            if name.eq_ignore_ascii_case("description") {
-                if let Some(content) = m.attr("content") {
-                    meta.description = Some(content.into());
-                }
-            }
-        }
-        if let Some(prop) = m.attr("property") {
-            if let Some(rest) = prop.strip_prefix("og:") {
-                if let Some(content) = m.attr("content") {
-                    meta.og_tags.push((rest.into(), content.into()));
-                }
-            }
-        }
-    }
-
-    meta
+pub(crate) fn is_ws(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{c}' | '\r' | ' ')
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::dom::parse;
-
-    #[test]
-    fn extracts_title() {
-        let doc = parse("<html><head><title>My Page</title></head></html>");
-        assert_eq!(extract_meta(&doc).title.as_deref(), Some("My Page"));
+/// Collapses runs of ASCII whitespace to one space and trims spaces.
+pub(crate) fn collapse(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for word in s.split(is_ws).filter(|w| !w.is_empty()) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
     }
+    out
+}
 
-    #[test]
-    fn extracts_description() {
-        let doc = parse(r#"<meta name="description" content="A great page.">"#);
-        assert_eq!(
-            extract_meta(&doc).description.as_deref(),
-            Some("A great page.")
-        );
-    }
-
-    #[test]
-    fn extracts_og_tags() {
-        let html = r#"
-            <meta property="og:title" content="OG Title">
-            <meta property="og:image" content="https://x.com/img.png">
-        "#;
-        let doc = parse(html);
-        let meta = extract_meta(&doc);
-        assert!(meta.og_tags.contains(&("title".into(), "OG Title".into())));
-        assert!(meta
-            .og_tags
-            .contains(&("image".into(), "https://x.com/img.png".into())));
-    }
-
-    #[test]
-    fn missing_tags_are_none() {
-        let doc = parse("<p>no meta here</p>");
-        let meta = extract_meta(&doc);
-        assert!(meta.title.is_none());
-        assert!(meta.description.is_none());
-        assert!(meta.og_tags.is_empty());
+impl Document {
+    /// Extracts [`PageMeta`] (SPEC section 9).
+    pub fn meta(&self) -> PageMeta {
+        let mut out = PageMeta::default();
+        let mut seen_title = false;
+        for id in self.elements() {
+            let el = self.node(id);
+            match el.name.as_str() {
+                "title" if !seen_title => {
+                    seen_title = true;
+                    let mut raw = String::new();
+                    for &c in &el.children {
+                        let n = self.node(c);
+                        if n.kind == NodeKind::Text {
+                            raw.push_str(&n.data);
+                        }
+                    }
+                    let t = collapse(&raw);
+                    out.title = if t.is_empty() { None } else { Some(t) };
+                }
+                "html" => {
+                    if out.lang.is_none() {
+                        out.lang = el.attr("lang").map(String::from);
+                    }
+                }
+                "meta" => {
+                    let Some(content) = el.attr("content") else {
+                        continue;
+                    };
+                    let name = el.attr("name").unwrap_or("").to_ascii_lowercase();
+                    if name == "description" && out.description.is_none() {
+                        out.description = Some(content.into());
+                    }
+                    let prop = el.attr("property").unwrap_or("");
+                    if prop.len() >= 3 && prop.as_bytes()[..3].eq_ignore_ascii_case(b"og:") {
+                        out.og.push((prop[3..].into(), content.into()));
+                    }
+                }
+                "link" if out.canonical.is_none() => {
+                    let rel = el.attr("rel").unwrap_or("").to_ascii_lowercase();
+                    if rel.split(is_ws).any(|r| r == "canonical") {
+                        out.canonical = el.attr("href").map(String::from);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 }

@@ -1,65 +1,90 @@
 # LombokHTML
 
-HTML ingestion: tolerant parser and DOM, entity decoding, text extraction, an allowlist sanitizer, CSS selectors, meta and table extraction.
+> A WHATWG HTML tokenizer that passes the html5lib-tests tokenizer suite, a small tree builder, serialization, text extraction, an allowlist sanitizer, a CSS selector subset, page metadata and table extraction. The same input gives the same output in Rust, TypeScript, Python, Go and PHP. No runtime dependencies.
 
-A standalone, general-purpose library of the **Lombok Ecosystem** — Tier **L0**. No mandatory dependency on any other Lombok library (L0).
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/codinglombok/LombokHTML/actions/workflows/ci.yml/badge.svg)](https://github.com/codinglombok/LombokHTML/actions/workflows/ci.yml)
+[![Vectors](https://img.shields.io/badge/shared%20vectors-228%20x%205%20ports-success)](vectors/)
+[![html5lib-tests](https://img.shields.io/badge/html5lib--tests%20tokenizer-7028%20cases-success)](conformance/)
+[![Lombok Ecosystem](https://img.shields.io/badge/Lombok-Ecosystem-2e7d5b?logo=github)](https://github.com/codinglombok)
 
-> **Universal by design.** Usable by anyone — from small embedded devices to premium industrial software — without any application or framework. It is not part of, and not owned by, any app or server (e.g. RAG stacks); apps are merely example users.
+Part of the [Lombok Ecosystem](https://github.com/codinglombok).
 
-## Status
+## Mengapa library ini? (Why this library?)
 
-🔵 **v0.1.0 — not yet published** to GitHub/registries. Rust reference + **TypeScript port** both pass the same shared test vectors (`vectors/lombokhtml-vectors-v1.json`, byte-identical behaviour per ADR-015). Python/Go/PHP ports are stubs. **Security note:** the sanitizer is allowlist-based and checked against an XSS corpus and an independent parser, but it has not been tested against real browsers (mXSS) or audited — add a Content-Security-Policy for highly untrusted input.
+- **One behaviour in five languages.** html5ever, parse5, html5lib, golang.org/x/net/html and DOMDocument each build slightly different trees and text. LombokHTML has one [SPEC](docs/SPEC_LombokHTML_v0.2.0.md) and 228 shared cases, so a scraper, an indexer and a sanitizer give the same result in the backend and the frontend.
+- **A real tokenizer.** Every port runs the 7028 tokenizer cases of html5lib-tests (character references, script data escapes, comments, DOCTYPE), not a regex approximation.
+- **Safe by default.** The sanitizer is an allowlist, drops `script`/`style`/`iframe` with their content, checks URL schemes like a browser does, and its output is a fixed point (sanitizing twice changes nothing).
+- **Bounded.** Depth 256, at most one million table cells, linear time on long text, attributes, comments and large sibling lists (checked by tests in every port).
+- **Small and embeddable.** No dependencies; the Rust crate is `no_std` + `alloc` with `forbid(unsafe_code)`.
 
-## Features
+## Installation
 
-- **Error-tolerant tokenizer & DOM** (subset HTML5): quoted/unquoted/boolean attributes (`>` inside quotes is safe), void & raw-text elements, comments, doctype; nesting-error recovery; depth capped at 256
-- **Entities**: numeric + common named references decoded; output always escaped
-- **Text**: `strip_tags`; `extract_structured_text` (headings `#`, lists `- `, table cells tab-separated)
-- **Allowlist sanitizer (secure by default)**: unknown tags unwrapped, dangerous tags dropped with content, attributes/URLs allowlisted (browser-style scheme check), customizable `Policy`, idempotent output
-- **Selectors**: tag, `*`, `.class`, `#id`, `[attr]`, `= ^= $= *= ~=`, descendant ` ` and child `>` combinators, `,` lists
-- **Meta** (`title`, `description`, `og:*`) and **tables** (`colspan` + `rowspan`, size-capped, nested tables correct)
-- `no_std + alloc` core, zero dependencies
+| Language | Package | Status |
+|---|---|---|
+| Rust | `lombokhtml` (crates.io) | not yet published |
+| TypeScript / JavaScript | `lombokhtml` (npm) | not yet published |
+| Python | `lombokhtml` (PyPI) | not yet published |
+| Go | `github.com/codinglombok/lombokhtml/go` | tag `go/v0.2.0` on release |
+| PHP | `codinglombok/lombokhtml` (Packagist) | needs a split repository first |
 
-## Quick Start
+## Quick start
 
-### Rust (reference)
+```ts
+import { parse, sanitize, htmlToText, stripTags } from 'lombokhtml';
 
-```toml
-[dependencies]
-lombokhtml = { git = "https://github.com/codinglombok/LombokHTML", package = "lombokhtml" }   # not on crates.io yet
+const html = '<h1>Title</h1><p onclick="x()">Body <a href="javascript:alert(1)">link</a> &amp; more</p>';
+sanitize(html);      // '<h1>Title</h1><p>Body <a>link</a> &amp; more</p>'
+htmlToText(html);    // '# Title\n\nBody link & more'
+stripTags(html);     // 'TitleBody link & more'
+parse(html).query('h1, p > a').map((e) => e.serialize());
+// ['<h1>Title</h1>', '<a href="javascript:alert(1)">link</a>']
 ```
 
 ```rust
-use lombokhtml::*;
-let html = "<h1>Title</h1><p onclick='x()'>Body <a href='javascript:alert(1)'>link</a></p>";
-sanitize(html);                       // "<h1>Title</h1><p>Body <a>link</a></p>"
-strip_tags(html);                     // "TitleBody link"
-let doc = parse(html);
-query(&doc, "h1, p > a").len();       // 2
-extract_tables(&parse("<table><tr><td rowspan=2>A</td><td>B</td></tr><tr><td>C</td></tr></table>"))[0]; // [["A","B"],["A","C"]]
+use lombokhtml::{parse, sanitize_with, Policy};
+
+let doc = parse("<table><tr><td rowspan=2>A<td>B<tr><td>C</table>");
+assert_eq!(doc.tables(), vec![vec![vec!["A", "B"], vec!["A", "C"]]]);
+let clean = sanitize_with("<iframe src='https://x'></iframe>", &Policy::new().allow_tag("iframe").allow_attr("iframe", "src"));
 ```
 
-### TypeScript
+```python
+import lombokhtml as h
+
+h.parse('<title>Q3</title><meta property="og:title" content="Report">').meta().to_dict()
+# {'title': 'Q3', 'description': None, 'canonical': None, 'lang': None, 'og': [['title', 'Report']]}
+h.tokenize('<a href=x>&copy;</a>')
+# [('StartTag', 'a', [('href', 'x')], False), ('Character', '©'), ('EndTag', 'a')]
+```
+
+```go
+doc := lombokhtml.Parse(html)
+links, err := doc.Query(`a[href^="https"]`) // err is *SelectorError for an invalid selector
+```
+
+```php
+use LombokHTML\Html;
+
+Html::sanitize('<img src=x onerror=alert(1)>');   // '<img src="x">'
+```
+
+## What it does not do
+
+The tree builder is a subset of the WHATWG algorithm: no implied `html`/`head`/`body`/`tbody`, no adoption agency or foster parenting, no SVG/MathML, `noscript` is always raw text. It is meant for extraction, sanitizing and querying, not for reproducing a browser DOM. See [docs/full_summary_project_LombokHTML_v0.2.0.md](docs/full_summary_project_LombokHTML_v0.2.0.md) and SPEC section 12.
+
+## Development
 
 ```bash
-cd typescript && npm install && npm test     # builds, then runs every shared vector
+python3 scripts/gen_ports.py --check && python3 vectors/build_vectors.py && python3 vectors/check_conformance.py
+cd rust && cargo test && cargo clippy --all-targets -- -D warnings
+cd typescript && npm ci && npm run coverage
+cd python && python -m pytest
+cd go && go test ./...
+cd php && php tests/run.php
+bash scripts/lombok-doctor.sh LombokHTML
 ```
-
-Zero runtime dependencies, ESM, Node ≥ 18. See `docs/API_LombokHTML_v0.1.0.md` for the camelCase API.
-
-## Testing
-
-```bash
-cd rust && cargo test --release                       # unit + robustness (pseudo-fuzz) + shared vectors
-cd rust && cargo build --no-default-features          # no_std + alloc proof
-cd typescript && npm test                             # same vectors, TypeScript port
-LOMBOK_REGEN=1 cargo test --release --test vectors    # regenerate expected outputs from the Rust reference (review the diff!)
-./scripts/lombok-doctor-docs.sh LombokHTML                # 12 docs, versions, vector hash, license, no ownership claims
-```
-
-Vector inputs are authored in `vectors/gen_inputs.py` (deterministic); expected outputs come from the Rust reference and are reviewed by hand and, where possible, by independent checks. Changing any vector requires updating its SHA-256 in `docs/SPEC_LombokHTML_v0.1.0.md` (CI enforces it).
-
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE). (MASTERPLAN §10.1 suggests `Apache-2.0 OR MIT`; pending owner decision.)
+Apache-2.0 ([LICENSE](LICENSE)). The html5lib-tests conformance data in `conformance/` is MIT ([conformance/LICENSE-html5lib-tests](conformance/LICENSE-html5lib-tests)).

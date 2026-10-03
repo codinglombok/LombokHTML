@@ -1,506 +1,917 @@
-// LombokHTML — TypeScript port (zero dependencies). Behaviour is defined by
-// SPEC_LombokHTML and verified against ../vectors/lombokhtml-vectors-v1.json.
-// Input is a JS string (UTF-16); all scanning is done on Unicode code points so
-// results are identical to the Rust reference.
+// LombokHTML: WHATWG HTML tokenizer, a small tree builder, serialization, text
+// extraction, an allowlist sanitizer, a CSS selector subset, page metadata and
+// table extraction, with byte-identical results in TypeScript, Rust, Python, Go
+// and PHP (see docs/SPEC_LombokHTML_v0.2.0.md). No dependencies.
+import { isAlnum, lookupNamed, MAX_ENTITY, numericChar, tokenize } from "./tokenizer.js";
 
-import { asciiLower, chars, isRustWhitespace, rustTrim } from "./compat.js";
+export { tokenize, tokenizeState } from "./tokenizer.js";
+export type { InitialState, Token } from "./tokenizer.js";
 
-// ───────────────────────────── entities ─────────────────────────────
+// ---------------------------------------------------------------- entities
 
-const NAMED: Record<string, string> = {
-  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0", copy: "\u00a9", reg: "\u00ae", trade: "\u2122",
-  hellip: "\u2026", mdash: "\u2014", ndash: "\u2013", lsquo: "\u2018", rsquo: "\u2019", ldquo: "\u201c", rdquo: "\u201d",
-  laquo: "\u00ab", raquo: "\u00bb", bull: "\u2022", middot: "\u00b7", euro: "\u20ac", pound: "\u00a3", yen: "\u00a5",
-  cent: "\u00a2", times: "\u00d7", divide: "\u00f7", deg: "\u00b0", plusmn: "\u00b1", sect: "\u00a7", para: "\u00b6",
-};
-function numeric(body: string): string | null {
-  let digits = body, radix = 10;
-  if (body.startsWith("x") || body.startsWith("X")) { digits = body.slice(1); radix = 16; }
-  const re = radix === 16 ? /^[0-9a-fA-F]+$/ : /^[0-9]+$/;
-  if (digits === "" || digits.length > 8 || !re.test(digits)) return null;
-  const n = parseInt(digits, radix);
-  if (n === 0 || n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)) return "\ufffd";
-  return String.fromCodePoint(n);
-}
-export function decodeEntities(s: string): string {
-  if (!s.includes("&")) return s;
-  let out = "", rest = s;
-  for (;;) {
-    const pos = rest.indexOf("&");
-    if (pos === -1) break;
-    out += rest.slice(0, pos);
-    const after = rest.slice(pos + 1);
-    // ';' must occur within the first 34 code points after '&'
-    let end = -1, count = 0;
-    for (let i = 0; i < after.length && count < 34; ) {
-      const cp = after.codePointAt(i)!;
-      if (cp === 0x3b) { end = i; break; }
-      i += cp > 0xffff ? 2 : 1; count++;
-    }
-    let decoded: string | null = null;
-    if (end !== -1) {
-      const body = after.slice(0, end);
-      decoded = body.startsWith("#") ? numeric(body.slice(1)) : Object.prototype.hasOwnProperty.call(NAMED, body) ? NAMED[body]! : null;
-    }
-    if (decoded !== null) { out += decoded; rest = after.slice(end + 1); }
-    else { out += "&"; rest = after; }
-  }
-  return out + rest;
-}
-export const escapeText = (s: string): string => s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
-export const escapeAttr = (s: string): string => s.replace(/[&<>"]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;"));
-
-// ───────────────────────────── tokenizer ─────────────────────────────
-
-export type Token =
-  | { type: "start"; name: string; attrs: Array<[string, string]>; selfClosing: boolean }
-  | { type: "end"; name: string } | { type: "text"; text: string } | { type: "comment"; text: string } | { type: "doctype"; text: string };
-
-export const VOID_ELEMENTS = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
-export const isVoidElement = (t: string): boolean => VOID_ELEMENTS.includes(t);
-const RAW_TEXT = ["script", "style"];
-
-const startsWith = (cs: string[], at: number, pat: string[]): boolean => pat.every((p, k) => cs[at + k] === p);
-const isAsciiAlphaChar = (c: string | undefined): boolean => c !== undefined && /^[A-Za-z]$/.test(c);
-
-function findTagEnd(cs: string[], from: number): number {
-  let i = from, quote: string | null = null;
-  while (i < cs.length) {
-    const c = cs[i]!;
-    if (quote !== null) { if (c === quote) quote = null; }
-    else {
-      if (c === ">") return i;
-      if (c === "=") {
-        let j = i + 1;
-        while (j < cs.length && isRustWhitespace(cs[j]!)) j++;
-        const q = cs[j];
-        if (q === '"' || q === "'") { quote = q; i = j; }
-      }
-    }
-    i++;
-  }
-  return cs.length;
-}
-
-function parseTagContents(raw: string): { name: string; attrs: Array<[string, string]>; selfClosing: boolean } {
-  const cs = chars(raw);
+/** Decodes character references as in text content (SPEC section 3.1). */
+export function decodeEntities(text: string): string {
+  const s = Array.from(text);
+  const n = s.length;
+  let out = "";
   let i = 0;
-  while (i < cs.length && isRustWhitespace(cs[i]!)) i++;
-  const ns = i;
-  while (i < cs.length && (/^[A-Za-z0-9]$/.test(cs[i]!) || cs[i] === "-" || cs[i] === ":")) i++;
-  const name = asciiLower(cs.slice(ns, i).join(""));
-  const attrs: Array<[string, string]> = [];
-  let selfClosing = false;
-  for (;;) {
-    while (i < cs.length && isRustWhitespace(cs[i]!)) i++;
-    if (i >= cs.length) break;
-    if (cs[i] === "/") { selfClosing = true; i++; continue; }
-    const as = i;
-    while (i < cs.length && !isRustWhitespace(cs[i]!) && cs[i] !== "=" && cs[i] !== "/") i++;
-    if (i === as) { i++; continue; }
-    const attrName = asciiLower(cs.slice(as, i).join(""));
-    while (i < cs.length && isRustWhitespace(cs[i]!)) i++;
-    let value = "";
-    if (cs[i] === "=") {
-      i++;
-      while (i < cs.length && isRustWhitespace(cs[i]!)) i++;
-      const q = cs[i];
-      if (q === '"' || q === "'") {
-        i++;
-        const vs = i;
-        while (i < cs.length && cs[i] !== q) i++;
-        value = cs.slice(vs, i).join("");
-        if (i < cs.length) i++;
-      } else if (q !== undefined) {
-        const vs = i;
-        while (i < cs.length && !isRustWhitespace(cs[i]!) && cs[i] !== "/") i++;
-        value = cs.slice(vs, i).join("");
-      }
-    }
-    attrs.push([attrName, decodeEntities(value)]);
-  }
-  return { name, attrs, selfClosing };
-}
-
-export function tokenize(html: string): Token[] {
-  const cs = chars(html), tokens: Token[] = [];
-  let i = 0, buf = "";
-  const flush = () => { if (buf !== "") { tokens.push({ type: "text", text: decodeEntities(buf) }); buf = ""; } };
-  const C_START = ["<", "!", "-", "-"], C_END = ["-", "-", ">"];
-  while (i < cs.length) {
-    if (cs[i] === "<") {
-      if (startsWith(cs, i, C_START)) {
-        flush();
-        const start = i + 4;
-        let end = start;
-        while (end < cs.length && !startsWith(cs, end, C_END)) end++;
-        tokens.push({ type: "comment", text: cs.slice(start, end).join("") });
-        i = end < cs.length ? end + 3 : cs.length;
-        continue;
-      }
-      if (asciiLower(cs.slice(i, i + 9).join("")) === "<!doctype") {
-        flush();
-        let end = i;
-        while (end < cs.length && cs[end] !== ">") end++;
-        tokens.push({ type: "doctype", text: cs.slice(i, Math.min(end, cs.length)).join("") });
-        i = end < cs.length ? end + 1 : cs.length;
-        continue;
-      }
-      if (cs[i + 1] === "/") {
-        flush();
-        let end = i + 2;
-        while (end < cs.length && cs[end] !== ">") end++;
-        const name = asciiLower(rustTrim(cs.slice(i + 2, Math.min(end, cs.length)).join("")));
-        if (name !== "") tokens.push({ type: "end", name });
-        i = end < cs.length ? end + 1 : cs.length;
-        continue;
-      }
-      if (isAsciiAlphaChar(cs[i + 1])) {
-        flush();
-        const ts = i + 1, end = findTagEnd(cs, ts);
-        const { name, attrs, selfClosing } = parseTagContents(cs.slice(ts, Math.min(end, cs.length)).join(""));
-        tokens.push({ type: "start", name, attrs, selfClosing });
-        i = end < cs.length ? end + 1 : cs.length;
-        if (RAW_TEXT.includes(name) && !selfClosing) {
-          const closePat = chars("</" + name);
-          let j = i, found = -1;
-          while (j < cs.length) { if (startsWith(cs, j, closePat)) { found = j; break; } j++; }
-          const contentEnd = found === -1 ? cs.length : found;
-          const raw = cs.slice(i, contentEnd).join("");
-          if (raw !== "") tokens.push({ type: "text", text: raw });
-          if (found !== -1) {
-            let k = found;
-            while (k < cs.length && cs[k] !== ">") k++;
-            tokens.push({ type: "end", name });
-            i = k < cs.length ? k + 1 : cs.length;
-          } else i = cs.length;
-        }
-        continue;
-      }
-      buf += "<"; i++;
+  while (i < n) {
+    if (s[i] !== "&") {
+      out += s[i++];
       continue;
     }
-    buf += cs[i]; i++;
+    const j = i + 1;
+    if (s[j] === "#") {
+      let k = j + 1;
+      const hex = s[k] === "x" || s[k] === "X";
+      if (hex) k++;
+      const re = hex ? /^[0-9A-Fa-f]$/ : /^[0-9]$/;
+      const start = k;
+      let code = 0;
+      while (k < n && re.test(s[k])) {
+        code = Math.min(code * (hex ? 16 : 10) + parseInt(s[k], 16), 0x110000);
+        k++;
+      }
+      if (k === start) {
+        out += s.slice(i, k).join("");
+        i = k;
+        continue;
+      }
+      if (s[k] === ";") k++;
+      out += numericChar(code);
+      i = k;
+      continue;
+    }
+    let k = j;
+    while (k < n && isAlnum(s[k]) && k - j < MAX_ENTITY) k++;
+    const run = s.slice(j, k).join("");
+    let match: string | null = null;
+    if (s[k] === ";" && lookupNamed(run + ";") !== undefined) match = run + ";";
+    else {
+      for (let m = run.length; m > 0; m--) {
+        if (lookupNamed(run.slice(0, m)) !== undefined) {
+          match = run.slice(0, m);
+          break;
+        }
+      }
+    }
+    if (match === null) {
+      out += "&" + run;
+      i = k;
+    } else {
+      out += lookupNamed(match)!;
+      i = j + match.length;
+    }
   }
-  flush();
-  return tokens;
+  return out;
 }
 
-// ───────────────────────────── DOM ─────────────────────────────
+/** Escapes text content: `&`, U+00A0, `<`, `>` (SPEC section 3.2). */
+export function escapeText(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/ /g, "&nbsp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Escapes an attribute value: `&`, U+00A0, `"`, `<`, `>` (SPEC section 3.2). */
+export function escapeAttr(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/ /g, "&nbsp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ---------------------------------------------------------------- tree
 
 export type NodeKind = "document" | "element" | "text" | "comment";
-export class Node {
-  constructor(public kind: NodeKind, public tag: string | null = null, public attrs: Array<[string, string]> = [], public text: string | null = null, public children: Node[] = []) {}
-  attr(name: string): string | undefined { return this.attrs.find(([k]) => k === name)?.[1]; }
-  isElement(tag: string): boolean { return this.kind === "element" && this.tag === tag; }
-  findFirst(tag: string): Node | undefined {
-    if (this.isElement(tag)) return this;
-    for (const c of this.children) { const f = c.findFirst(tag); if (f) return f; }
-    return undefined;
+
+/** A tree node. `name` and `attrs` are set for elements, `data` for text and comments. */
+export class HtmlNode {
+  parent: HtmlNode | null = null;
+  readonly children: HtmlNode[] = [];
+
+  constructor(
+    readonly kind: NodeKind,
+    readonly name: string = "",
+    readonly attrs: [string, string][] = [],
+    public data: string = "",
+  ) {}
+
+  /** Value of the first attribute called `name`. */
+  attr(name: string): string | null {
+    for (const [k, v] of this.attrs) if (k === name) return v;
+    return null;
   }
-  findAll(tag: string): Node[] {
-    const out: Node[] = [];
-    for (const c of this.children) { if (c.isElement(tag)) out.push(c); out.push(...c.findAll(tag)); }
+
+  /** True for an element called `name`. */
+  is(name: string): boolean {
+    return this.kind === "element" && this.name === name;
+  }
+
+  /** Elements below this node in document order. */
+  elements(): HtmlNode[] {
+    const out: HtmlNode[] = [];
+    const todo = [...this.children].reverse();
+    while (todo.length > 0) {
+      const n = todo.pop()!;
+      if (n.kind === "element") {
+        out.push(n);
+        for (let i = n.children.length - 1; i >= 0; i--) todo.push(n.children[i]);
+      }
+    }
     return out;
   }
+
+  /** Element children of the parent, this node included. */
+  elementSiblings(): HtmlNode[] {
+    return this.parent === null ? [this] : this.parent.children.filter((c) => c.kind === "element");
+  }
+
+  /** HTML serialization: outer HTML of an element, inner HTML of the document (SPEC section 5). */
+  serialize(): string {
+    const out: string[] = [];
+    writeNode(this, out);
+    return out.join("");
+  }
+
+  /** Text below this node, skipping script, style, noscript, template and title (SPEC section 6.1). */
+  textContent(): string {
+    const out: string[] = [];
+    const walk = (n: HtmlNode): void => {
+      if (n.kind === "text") out.push(n.data);
+      else if (n.kind === "document" || (n.kind === "element" && !HIDDEN.has(n.name))) n.children.forEach(walk);
+    };
+    walk(this);
+    return out.join("");
+  }
+
+  /** Structure-preserving plain text (SPEC section 6.2). */
+  extractText(): string {
+    return extractText(this);
+  }
+
+  /** Elements below this node matching `selector`, in document order (SPEC section 8). Throws {@link SelectorError}. */
+  query(selector: string): HtmlNode[] {
+    const sel = Selector.parse(selector);
+    const ctx = new Ctx();
+    return this.elements().filter((e) => sel.matchesIn(e, ctx));
+  }
+
+  /** Page metadata (SPEC section 9). */
+  meta(): PageMeta {
+    return extractMeta(this);
+  }
+
+  /** Every table as a grid of cell texts (SPEC section 10). */
+  tables(): string[][][] {
+    return extractTables(this);
+  }
 }
+
+const set = (s: string): Set<string> => new Set(s.split(" "));
+const VOID = set("area base basefont bgsound br col embed frame hr img input keygen link meta param source track wbr");
+const RAW_PARENTS = set("style script xmp iframe noembed noframes plaintext noscript");
+const SPECIAL = set(
+  "address applet area article aside base basefont bgsound blockquote body br button caption center col colgroup dd " +
+    "details dir div dl dt embed fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header " +
+    "hgroup hr html iframe img input keygen li link listing main marquee menu meta nav noembed noframes noscript " +
+    "object ol p param plaintext pre script search section select source style summary table tbody td template " +
+    "textarea tfoot th thead title tr track ul wbr xmp",
+);
+const P_CLOSERS = set(
+  "address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer form h1 h2 " +
+    "h3 h4 h5 h6 header hgroup hr li dd dt listing main menu nav ol p plaintext pre search section summary table ul xmp",
+);
+const HEADINGS = set("h1 h2 h3 h4 h5 h6");
+const SCOPE = set("applet caption html table td th marquee object template");
+const BUTTON_SCOPE = new Set([...SCOPE, "button"]);
+const LIST_SCOPE = new Set([...SCOPE, "ol", "ul"]);
+const TABLE_SCOPE = set("html table template");
+const TABLE_PARTS = set("table caption tbody thead tfoot tr td th");
+const SECTIONS = set("thead tbody tfoot");
+const HIDDEN = set("script style noscript template title");
+const BLOCKS = set(
+  "address article aside blockquote caption details dialog div dl fieldset figcaption figure footer form header " +
+    "hgroup main nav ol p pre section summary table ul",
+);
+
+/** Maximum number of open elements; deeper start tags are ignored. */
 export const MAX_DEPTH = 256;
 
-export function parse(html: string): Node {
-  const root = new Node("document"), stack: Node[] = [];
-  const push = (n: Node) => (stack.length ? stack[stack.length - 1]! : root).children.push(n);
-  for (const t of tokenize(html)) {
-    switch (t.type) {
-      case "doctype": break;
-      case "comment": push(new Node("comment", null, [], t.text)); break;
-      case "text": push(new Node("text", null, [], t.text)); break;
-      case "start": {
-        const n = new Node("element", t.name, t.attrs);
-        if (t.selfClosing || isVoidElement(t.name) || stack.length >= MAX_DEPTH) push(n); else stack.push(n);
-        break;
-      }
-      case "end": {
-        let pos = -1;
-        for (let k = stack.length - 1; k >= 0; k--) if (stack[k]!.tag === t.name) { pos = k; break; }
-        if (pos !== -1) while (stack.length > pos) push(stack.pop()!);
-        break;
-      }
-    }
-  }
-  while (stack.length) push(stack.pop()!);
-  return root;
-}
-
-// ───────────────────────────── text extraction ─────────────────────────────
-
-const invisible = (tag: string): boolean => tag === "script" || tag === "style" || tag === "noscript" || tag === "template";
-function collectText(n: Node, out: string[]): void {
-  if (n.tag !== null && invisible(n.tag)) return;
-  if (n.kind === "text") { out.push(n.text ?? ""); return; }
-  for (const c of n.children) collectText(c, out);
-}
-export function stripTags(html: string): string { const out: string[] = []; collectText(parse(html), out); return out.join(""); }
-
-const HEADERS: Record<string, string> = { h1: "# ", h2: "## ", h3: "### ", h4: "#### ", h5: "##### ", h6: "###### " };
-function walkStructured(n: Node, out: string[]): void {
-  if (n.tag !== null) {
-    if (invisible(n.tag)) return;
-    if (Object.prototype.hasOwnProperty.call(HEADERS, n.tag)) {
-      out.push("\n", HEADERS[n.tag]!); for (const c of n.children) walkStructured(c, out); out.push("\n"); return;
-    }
-    switch (n.tag) {
-      case "li": out.push("\n- "); for (const c of n.children) walkStructured(c, out); return;
-      case "br": out.push("\n"); return;
-      case "p": case "div": case "tr": case "ul": case "ol": case "table":
-        out.push("\n"); for (const c of n.children) walkStructured(c, out); out.push("\n"); return;
-      case "td": case "th": for (const c of n.children) walkStructured(c, out); out.push("\t"); return;
-    }
-  }
-  if (n.kind === "text") out.push(n.text ?? "");
-  else for (const c of n.children) walkStructured(c, out);
-}
-export function extractStructuredText(html: string): string {
-  const out: string[] = [];
-  walkStructured(parse(html), out);
-  let collapsed = "", run = 0;
-  for (const c of out.join("")) {
-    if (c === "\n") { run++; if (run <= 2) collapsed += c; } else { run = 0; collapsed += c; }
-  }
-  return rustTrim(collapsed);
-}
-
-// ───────────────────────────── sanitizer ─────────────────────────────
-
-export interface Policy {
-  allowedTags: string[]; dropWithContent: string[]; globalAttrs: string[]; tagAttrs: Array<[string, string]>; urlAttrs: string[]; allowedSchemes: string[];
-}
-export function defaultPolicy(): Policy {
-  const w = (s: string) => s.split(" ");
-  return {
-    allowedTags: w("a abbr b blockquote br caption cite code dd del dfn div dl dt em figcaption figure h1 h2 h3 h4 h5 h6 hr i img ins kbd li mark ol p pre q s samp small span strong sub sup table tbody td tfoot th thead time tr u ul"),
-    dropWithContent: w("script style iframe frame frameset object embed applet svg math template noscript head title select option textarea button audio video canvas base link meta"),
-    globalAttrs: w("title lang dir"),
-    tagAttrs: [["a", "href"], ["img", "src"], ["img", "alt"], ["img", "width"], ["img", "height"], ["td", "colspan"], ["td", "rowspan"], ["th", "colspan"], ["th", "rowspan"], ["th", "scope"], ["ol", "start"], ["blockquote", "cite"], ["q", "cite"], ["time", "datetime"]],
-    urlAttrs: w("href src cite"),
-    allowedSchemes: w("http https mailto tel"),
+/** Parses `html` into a document node (SPEC section 4). Never throws. */
+export function parse(html: string): HtmlNode {
+  const doc = new HtmlNode("document");
+  const stack: HtmlNode[] = [];
+  const current = (): HtmlNode => (stack.length > 0 ? stack[stack.length - 1] : doc);
+  const append = (node: HtmlNode): void => {
+    const p = current();
+    node.parent = p;
+    p.children.push(node);
   };
+  const inScope = (names: Set<string>, boundary: Set<string>): boolean => {
+    for (let i = stack.length - 1; i >= 0; i--) {
+      if (names.has(stack[i].name)) return true;
+      if (boundary.has(stack[i].name)) return false;
+    }
+    return false;
+  };
+  const popUntil = (names: Set<string>): void => {
+    while (stack.length > 0) if (names.has(stack.pop()!.name)) return;
+  };
+  const top = (): string | null => (stack.length > 0 ? stack[stack.length - 1].name : null);
+
+  const start = (name: string, attrs: [string, string][]): boolean => {
+    if (name === "li" || name === "dd" || name === "dt") {
+      const targets = name === "li" ? set("li") : set("dd dt");
+      for (let i = stack.length - 1; i >= 0; i--) {
+        const cur = stack[i].name;
+        if (targets.has(cur)) {
+          stack.length = i;
+          break;
+        }
+        if (SPECIAL.has(cur) && cur !== "address" && cur !== "div" && cur !== "p") break;
+      }
+    }
+    if (P_CLOSERS.has(name) && inScope(set("p"), BUTTON_SCOPE)) popUntil(set("p"));
+    if (HEADINGS.has(name) && HEADINGS.has(top() ?? "")) stack.pop();
+    if ((name === "option" || name === "optgroup") && top() === "option") stack.pop();
+    if (name === "a" && stack.some((n) => n.name === "a")) popUntil(set("a"));
+    if (["td", "th", "tr", "thead", "tbody", "tfoot"].includes(name) && inScope(set("td th"), TABLE_SCOPE))
+      popUntil(set("td th"));
+    if (["tr", "thead", "tbody", "tfoot"].includes(name) && inScope(set("tr"), TABLE_SCOPE)) popUntil(set("tr"));
+    if (SECTIONS.has(name) && inScope(SECTIONS, TABLE_SCOPE)) popUntil(SECTIONS);
+    if (stack.length >= MAX_DEPTH) return false;
+    const el = new HtmlNode("element", name, attrs);
+    append(el);
+    if (!VOID.has(name)) stack.push(el);
+    return name === "pre" || name === "listing" || name === "textarea";
+  };
+
+  const end = (name: string): void => {
+    if (name === "br") {
+      start("br", []);
+      return;
+    }
+    let target: Set<string>;
+    let boundary: Set<string>;
+    if (name === "p") [target, boundary] = [set("p"), BUTTON_SCOPE];
+    else if (HEADINGS.has(name)) [target, boundary] = [HEADINGS, SCOPE];
+    else if (name === "li") [target, boundary] = [set("li"), LIST_SCOPE];
+    else if (TABLE_PARTS.has(name)) [target, boundary] = [set(name), TABLE_SCOPE];
+    else if (name === "dd" || name === "dt" || SPECIAL.has(name)) [target, boundary] = [set(name), SCOPE];
+    else {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].name === name) {
+          stack.length = i;
+          return;
+        }
+        if (SPECIAL.has(stack[i].name)) return;
+      }
+      return;
+    }
+    if (inScope(target, boundary)) popUntil(target);
+  };
+
+  let skipNewline = false;
+  for (const tok of tokenize(html)) {
+    if (tok.type === "Character") {
+      let data = tok.data;
+      if (skipNewline && data.startsWith("\n")) data = data.slice(1);
+      skipNewline = false;
+      if (data !== "") {
+        const p = current();
+        const last = p.children[p.children.length - 1];
+        if (last !== undefined && last.kind === "text") last.data += data;
+        else append(new HtmlNode("text", "", [], data));
+      }
+      continue;
+    }
+    skipNewline = false;
+    if (tok.type === "StartTag") skipNewline = start(tok.name, tok.attrs);
+    else if (tok.type === "EndTag") end(tok.name);
+    else if (tok.type === "Comment") append(new HtmlNode("comment", "", [], tok.data));
+  }
+  return doc;
 }
-/** True if `value` is a relative URL or uses an allowed scheme (browser-style whitespace/control stripping). */
-export function isSafeUrl(value: string, allowedSchemes: string[]): boolean {
-  const cleaned = asciiLower(chars(value).filter((c) => !(c.codePointAt(0)! <= 0x20 || c === "\u007f")).join(""));
-  const i = cleaned.search(/[:/?#]/);
-  if (i !== -1 && cleaned[i] === ":") return allowedSchemes.includes(cleaned.slice(0, i));
+
+function writeNode(n: HtmlNode, out: string[]): void {
+  if (n.kind === "text") {
+    const raw = n.parent !== null && n.parent.kind === "element" && RAW_PARENTS.has(n.parent.name);
+    out.push(raw ? n.data : escapeText(n.data));
+  } else if (n.kind === "comment") {
+    out.push(`<!--${n.data}-->`);
+  } else if (n.kind === "element") {
+    out.push("<" + n.name);
+    for (const [k, v] of n.attrs) out.push(` ${k}="${escapeAttr(v)}"`);
+    out.push(">");
+    if (VOID.has(n.name)) return;
+    for (const c of n.children) writeNode(c, out);
+    out.push(`</${n.name}>`);
+  } else {
+    for (const c of n.children) writeNode(c, out);
+  }
+}
+
+// ---------------------------------------------------------------- text
+
+function extractText(node: HtmlNode): string {
+  const parts: string[] = [];
+  let lastCh = "";
+  const push = (t: string): void => {
+    if (t !== "") {
+      parts.push(t);
+      lastCh = t[t.length - 1];
+    }
+  };
+  const walk = (n: HtmlNode, pre: boolean): void => {
+    if (n.kind === "text") {
+      if (pre) {
+        push(n.data);
+        return;
+      }
+      let collapsed = n.data.replace(/[\t\n\f\r ]+/g, " ");
+      if (collapsed.startsWith(" ") && (lastCh === "" || lastCh === " " || lastCh === "\n" || lastCh === "\t"))
+        collapsed = collapsed.slice(1);
+      push(collapsed);
+      return;
+    }
+    if (n.kind === "comment") return;
+    if (n.kind === "document") {
+      for (const c of n.children) walk(c, pre);
+      return;
+    }
+    const name = n.name;
+    if (HIDDEN.has(name)) return;
+    if (HEADINGS.has(name)) {
+      push("\n\n" + "#".repeat(Number(name[1])) + " ");
+      for (const c of n.children) walk(c, pre);
+      push("\n\n");
+      return;
+    }
+    if (name === "li") push("\n- ");
+    else if (name === "dd" || name === "dt" || name === "tr") push("\n");
+    else if (name === "br") {
+      push("\n");
+      return;
+    } else if (name === "hr") {
+      push("\n\n---\n\n");
+      return;
+    }
+    const block = BLOCKS.has(name);
+    if (block) push("\n\n");
+    const innerPre = pre || name === "pre" || name === "listing" || name === "textarea";
+    for (const c of n.children) walk(c, innerPre);
+    if (name === "td" || name === "th") push("\t");
+    if (block) push("\n\n");
+  };
+  walk(node, false);
+  const text = parts
+    .join("")
+    .split("\n")
+    .map((l) => l.replace(/[ \t]+$/, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
+  return text.replace(/^\n+/, "").replace(/\n+$/, "");
+}
+
+/** Parses `html` and returns its structure-preserving plain text. */
+export function htmlToText(html: string): string {
+  return parse(html).extractText();
+}
+
+/** Parses `html` and returns its text content without markup. */
+export function stripTags(html: string): string {
+  return parse(html).textContent();
+}
+
+// ---------------------------------------------------------------- sanitizer
+
+const DEFAULT_ALLOWED =
+  "a abbr b blockquote br caption cite code dd del dfn div dl dt em figcaption figure h1 h2 h3 h4 h5 h6 hr i img " +
+  "ins kbd li mark ol p pre q s samp small span strong sub sup table tbody td tfoot th thead time tr u ul";
+const DEFAULT_DROP =
+  "applet audio base button canvas embed frame frameset head iframe link math meta noembed noframes noscript " +
+  "object option plaintext script select style svg template textarea title video xmp";
+const DEFAULT_ATTRS =
+  "*:dir *:lang *:title a:href blockquote:cite img:alt img:height img:src img:width ol:start q:cite td:colspan " +
+  "td:rowspan th:colspan th:rowspan th:scope time:datetime";
+const URL_ATTRS = set("cite href src");
+/** URL schemes allowed by default. */
+export const DEFAULT_SCHEMES: readonly string[] = ["http", "https", "mailto", "tel"];
+
+const asciiLower = (s: string): string => s.replace(/[A-Z]/g, (m) => String.fromCharCode(m.charCodeAt(0) + 32));
+
+/** Sanitizer policy: the defaults plus extra tags, attributes and schemes. */
+export class Policy {
+  private readonly tags = set(DEFAULT_ALLOWED);
+  private readonly drop = set(DEFAULT_DROP);
+  private readonly attrs = set(DEFAULT_ATTRS);
+  /** @internal */
+  readonly schemes = new Set(DEFAULT_SCHEMES);
+
+  /** Keeps `tag` (ASCII case-insensitive), also when it is on the drop list. */
+  allowTag(tag: string): this {
+    const t = asciiLower(tag);
+    if (t === "plaintext") return this; // cannot be closed again, so never kept
+    this.tags.add(t);
+    this.drop.delete(t);
+    return this;
+  }
+
+  /** Keeps attribute `attr` on `tag`; tag `"*"` means every kept element. */
+  allowAttr(tag: string, attr: string): this {
+    this.attrs.add(asciiLower(tag) + ":" + asciiLower(attr));
+    return this;
+  }
+
+  /** Accepts URLs with `scheme` in `href`, `src` and `cite`. */
+  allowScheme(scheme: string): this {
+    this.schemes.add(asciiLower(scheme));
+    return this;
+  }
+
+  /** @internal */
+  keep(tag: string): "drop" | "unwrap" | "keep" {
+    return this.drop.has(tag) ? "drop" : this.tags.has(tag) ? "keep" : "unwrap";
+  }
+
+  /** @internal */
+  attrOk(tag: string, attr: string): boolean {
+    return this.attrs.has(tag + ":" + attr) || this.attrs.has("*:" + attr);
+  }
+}
+
+/**
+ * True when `url` has no scheme or one of `schemes` (lowercase), after removing
+ * C0 controls, space and DEL (SPEC section 7.3).
+ */
+export function isSafeUrl(url: string, schemes: Iterable<string> = DEFAULT_SCHEMES): boolean {
+  const allowed = new Set(schemes);
+  let cleaned = "";
+  for (const ch of url) {
+    const cp = ch.codePointAt(0)!;
+    if (cp > 0x20 && cp !== 0x7f) cleaned += ch;
+  }
+  cleaned = asciiLower(cleaned);
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i];
+    if (ch === "/" || ch === "?" || ch === "#") return true;
+    if (ch === ":") return allowed.has(cleaned.slice(0, i));
+  }
   return true;
 }
-function clean(n: Node, p: Policy, out: string[]): void {
-  switch (n.kind) {
-    case "text": out.push(escapeText(n.text ?? "")); return;
-    case "comment": return;
-    case "document": for (const c of n.children) clean(c, p, out); return;
-    case "element": {
-      const tag = n.tag ?? "";
-      if (p.dropWithContent.includes(tag)) return;
-      if (!p.allowedTags.includes(tag)) { for (const c of n.children) clean(c, p, out); return; }
-      out.push("<", tag);
-      const seen: string[] = [];
-      for (const [k, v] of n.attrs) {
-        if (seen.includes(k)) continue;
-        if (!(p.globalAttrs.includes(k) || p.tagAttrs.some(([t, a]) => t === tag && a === k))) continue;
-        if (p.urlAttrs.includes(k) && !isSafeUrl(v, p.allowedSchemes)) continue;
-        seen.push(k);
-        out.push(" ", k, '="', escapeAttr(v), '"');
-      }
-      if (isVoidElement(tag)) out.push(" />");
-      else { out.push(">"); for (const c of n.children) clean(c, p, out); out.push("</", tag, ">"); }
-    }
-  }
-}
-export function sanitizeWith(html: string, policy: Policy): string { const out: string[] = []; clean(parse(html), policy, out); return out.join(""); }
-export const sanitize = (html: string): string => sanitizeWith(html, defaultPolicy());
 
-// ───────────────────────────── selectors ─────────────────────────────
-
-export type AttrOp = "exists" | "equals" | "prefix" | "suffix" | "contains" | "word";
-export interface Selector { tag?: string; id?: string; classes: string[]; attrs: Array<[string, AttrOp, string]> }
-export type Combinator = "descendant" | "child";
-export interface Complex { parts: Array<[Combinator, Selector]> }
-const isIdent = (c: string): boolean => /^[A-Za-z0-9_-]$/.test(c);
-
-export function parseSelector(sel: string): Selector {
-  const s: Selector = { classes: [], attrs: [] };
-  const cs = chars(rustTrim(sel));
-  let i = 0;
-  if (cs[0] === "*") i = 1;
-  else {
-    while (i < cs.length && isIdent(cs[i]!)) i++;
-    if (i > 0) s.tag = asciiLower(cs.slice(0, i).join(""));
-  }
-  while (i < cs.length) {
-    const c = cs[i]!;
-    if (c === "#" || c === ".") {
-      i++;
-      const st = i;
-      while (i < cs.length && isIdent(cs[i]!)) i++;
-      const name = cs.slice(st, i).join("");
-      if (c === "#") s.id = name; else s.classes.push(name);
-    } else if (c === "[") {
-      i++;
-      const st = i;
-      while (i < cs.length && !["=", "]", "^", "$", "*", "~"].includes(cs[i]!)) i++;
-      const name = asciiLower(rustTrim(cs.slice(st, i).join("")));
-      let op: AttrOp = "exists";
-      const cur = cs[i];
-      if (cur === "=") { op = "equals"; i++; }
-      else if ((cur === "^" || cur === "$" || cur === "*" || cur === "~") && cs[i + 1] === "=") {
-        op = cur === "^" ? "prefix" : cur === "$" ? "suffix" : cur === "*" ? "contains" : "word";
-        i += 2;
-      }
-      let value = "";
-      if (op !== "exists") {
-        let quote: string | undefined;
-        if (cs[i] === '"' || cs[i] === "'") { quote = cs[i]; i++; }
-        const vs = i;
-        while (i < cs.length && cs[i] !== "]" && cs[i] !== quote) i++;
-        value = cs.slice(vs, i).join("");
-        if (quote !== undefined && i < cs.length) i++;
-      }
-      while (i < cs.length && cs[i] !== "]") i++;
-      i++;
-      s.attrs.push([name, op, value]);
-    } else i++;
-  }
-  return s;
-}
-const splitWhitespace = (s: string): string[] => {
-  const out: string[] = []; let cur = "";
-  for (const c of chars(s)) { if (isRustWhitespace(c)) { if (cur) { out.push(cur); cur = ""; } } else cur += c; }
-  if (cur) out.push(cur);
-  return out;
-};
-export function parseSelectorList(sel: string): Complex[] {
-  return sel.split(",").map((part) => {
-    const cx: Complex = { parts: [] };
-    let pendingChild = false;
-    for (const tok of splitWhitespace(part.split(">").join(" > "))) {
-      if (tok === ">") { pendingChild = true; continue; }
-      cx.parts.push([pendingChild ? "child" : "descendant", parseSelector(tok)]);
-      pendingChild = false;
+/** Sanitizes `html` with `policy` (SPEC section 7). The result is a fixed point. */
+export function sanitize(html: string, policy: Policy = new Policy()): string {
+  const out: string[] = [];
+  const walk = (n: HtmlNode): void => {
+    if (n.kind === "text") {
+      out.push(escapeText(n.data));
+      return;
     }
-    return cx;
-  }).filter((c) => c.parts.length > 0);
-}
-function attrMatches(n: Node, name: string, op: AttrOp, expected: string): boolean {
-  const actual = n.attr(name);
-  if (actual === undefined) return false;
-  switch (op) {
-    case "exists": return true;
-    case "equals": return actual === expected;
-    case "prefix": return expected !== "" && actual.startsWith(expected);
-    case "suffix": return expected !== "" && actual.endsWith(expected);
-    case "contains": return expected !== "" && actual.includes(expected);
-    case "word": return splitWhitespace(actual).includes(expected);
-  }
-}
-function compoundMatches(n: Node, s: Selector): boolean {
-  if (n.kind !== "element") return false;
-  if (s.tag !== undefined && n.tag !== s.tag) return false;
-  if (s.id !== undefined && n.attr("id") !== s.id) return false;
-  if (s.classes.length) { const cls = splitWhitespace(n.attr("class") ?? ""); if (!s.classes.every((c) => cls.includes(c))) return false; }
-  return s.attrs.every(([nm, op, v]) => attrMatches(n, nm, op, v));
-}
-function complexMatches(parts: Array<[Combinator, Selector]>, idx: number, n: Node, anc: Node[]): boolean {
-  if (!compoundMatches(n, parts[idx]![1])) return false;
-  if (idx === 0) return true;
-  if (parts[idx]![0] === "child") return anc.length > 0 && complexMatches(parts, idx - 1, anc[anc.length - 1]!, anc.slice(0, -1));
-  for (let k = anc.length - 1; k >= 0; k--) if (complexMatches(parts, idx - 1, anc[k]!, anc.slice(0, k))) return true;
-  return false;
-}
-export function query(root: Node, selector: string): Node[] {
-  const list = parseSelectorList(selector), out: Node[] = [];
-  if (!list.length) return out;
-  const anc: Node[] = [];
-  const walk = (n: Node) => {
-    for (const c of n.children) {
-      if (c.kind === "element" && list.some((cx) => complexMatches(cx.parts, cx.parts.length - 1, c, anc))) out.push(c);
-      if (c.kind === "element") { anc.push(c); walk(c); anc.pop(); }
+    if (n.kind === "comment") return;
+    if (n.kind === "document") {
+      n.children.forEach(walk);
+      return;
     }
+    const action = policy.keep(n.name);
+    if (action === "drop") return;
+    if (action === "unwrap") {
+      n.children.forEach(walk);
+      return;
+    }
+    out.push("<" + n.name);
+    for (const [k, v] of n.attrs) {
+      if (!policy.attrOk(n.name, k)) continue;
+      if (URL_ATTRS.has(k) && !isSafeUrl(v, policy.schemes)) continue;
+      out.push(` ${k}="${escapeAttr(v)}"`);
+    }
+    out.push(">");
+    if (VOID.has(n.name)) return;
+    // Raw text content would not survive a second pass, so it is dropped.
+    if (!RAW_PARENTS.has(n.name)) n.children.forEach(walk);
+    out.push(`</${n.name}>`);
   };
-  walk(root);
+  walk(parse(html));
+  return out.join("");
+}
+
+// ---------------------------------------------------------------- selectors
+
+/** A selector that does not follow the SPEC grammar; `offset` counts code points. */
+export class SelectorError extends Error {
+  readonly code = "BAD_SELECTOR";
+
+  constructor(readonly offset: number) {
+    super(`BAD_SELECTOR at character ${offset}`);
+    this.name = "SelectorError";
+  }
+}
+
+type Simple =
+  | { k: "id" | "class"; v: string }
+  | { k: "attr"; name: string; op: string | null; v: string }
+  | { k: "first-child" | "last-child" | "only-child" | "empty" }
+  | { k: "nth-child" | "nth-last-child"; a: number; b: number }
+  | { k: "not"; inner: Compound };
+interface Compound {
+  tag: string | null;
+  simple: Simple[];
+}
+type Complex = [string, Compound][];
+
+const isWsSel = (c: string | undefined): boolean =>
+  c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+const isIdent = (c: string | undefined): boolean =>
+  c !== undefined && (/^[A-Za-z0-9_-]$/.test(c) || c.codePointAt(0)! > 0x7f);
+
+class SelParser {
+  private readonly s: string[];
+  private i = 0;
+
+  constructor(text: string) {
+    this.s = Array.from(text);
+  }
+
+  private fail(): never {
+    throw new SelectorError(this.i);
+  }
+
+  private ws(): boolean {
+    const start = this.i;
+    while (isWsSel(this.s[this.i])) this.i++;
+    return this.i > start;
+  }
+
+  private ident(): string {
+    const start = this.i;
+    while (isIdent(this.s[this.i])) this.i++;
+    if (this.i === start) this.fail();
+    return this.s.slice(start, this.i).join("");
+  }
+
+  list(): Complex[] {
+    const out: Complex[] = [];
+    for (;;) {
+      this.ws();
+      out.push(this.complex());
+      this.ws();
+      if (this.i >= this.s.length) return out;
+      if (this.s[this.i] !== ",") this.fail();
+      this.i++;
+    }
+  }
+
+  private complex(): Complex {
+    const parts: Complex = [["", this.compound()]];
+    for (;;) {
+      const save = this.i;
+      const hadWs = this.ws();
+      const c = this.s[this.i];
+      if (c === undefined || c === ",") {
+        this.i = save;
+        return parts;
+      }
+      if (c === ">" || c === "+" || c === "~") {
+        this.i++;
+        this.ws();
+        parts.push([c, this.compound()]);
+      } else if (hadWs) parts.push([" ", this.compound()]);
+      else this.fail();
+    }
+  }
+
+  private compound(): Compound {
+    const comp: Compound = { tag: null, simple: [] };
+    if (this.s[this.i] === "*") {
+      this.i++;
+      comp.tag = "*";
+    } else if (isIdent(this.s[this.i])) comp.tag = asciiLower(this.ident());
+    for (;;) {
+      const c = this.s[this.i];
+      if (c === "#" || c === ".") {
+        this.i++;
+        comp.simple.push({ k: c === "#" ? "id" : "class", v: this.ident() });
+      } else if (c === "[") {
+        this.i++;
+        this.ws();
+        const name = asciiLower(this.ident());
+        this.ws();
+        let op: string | null = null;
+        let v = "";
+        const two = this.s.slice(this.i, this.i + 2).join("");
+        if (this.s[this.i] === "=") {
+          op = "=";
+          this.i++;
+        } else if (["~=", "|=", "^=", "$=", "*="].includes(two)) {
+          op = two;
+          this.i += 2;
+        }
+        if (op !== null) {
+          this.ws();
+          const q = this.s[this.i];
+          if (q === "'" || q === '"') {
+            const end = this.s.indexOf(q, this.i + 1);
+            if (end < 0) this.fail();
+            v = this.s.slice(this.i + 1, end).join("");
+            this.i = end + 1;
+          } else v = this.ident();
+          this.ws();
+        }
+        if (this.s[this.i] !== "]") this.fail();
+        this.i++;
+        comp.simple.push({ k: "attr", name, op, v });
+      } else if (c === ":") {
+        this.i++;
+        const name = asciiLower(this.ident());
+        if (name === "first-child" || name === "last-child" || name === "only-child" || name === "empty") {
+          comp.simple.push({ k: name });
+        } else if (name === "nth-child" || name === "nth-last-child" || name === "not") {
+          if (this.s[this.i] !== "(") this.fail();
+          this.i++;
+          this.ws();
+          let simple: Simple;
+          if (name === "not") {
+            simple = { k: "not", inner: this.compound() };
+            this.ws();
+          } else {
+            const end = this.s.indexOf(")", this.i);
+            if (end < 0) this.fail();
+            const ab = parseNth(this.s.slice(this.i, end).join(""));
+            if (ab === null) this.fail();
+            this.i = end;
+            simple = { k: name, a: ab[0], b: ab[1] };
+          }
+          if (this.s[this.i] !== ")") this.fail();
+          this.i++;
+          comp.simple.push(simple);
+        } else this.fail();
+      } else break;
+    }
+    if (comp.tag === null && comp.simple.length === 0) this.fail();
+    return comp;
+  }
+}
+
+function parseNth(text: string): [number, number] | null {
+  const t = asciiLower(text.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ""));
+  if (t === "odd") return [2, 1];
+  if (t === "even") return [2, 0];
+  if (/^[+-]?[0-9]{1,9}$/.test(t)) return [0, parseInt(t, 10)];
+  const m = /^([+-]?[0-9]{0,9})n(?:[\t\n\f\r ]*([+-])[\t\n\f\r ]*([0-9]{1,9}))?$/.exec(t);
+  if (m === null) return null;
+  const a = m[1] === "" || m[1] === "+" ? 1 : m[1] === "-" ? -1 : parseInt(m[1], 10);
+  const b = m[3] === undefined ? 0 : parseInt(m[3], 10) * (m[2] === "-" ? -1 : 1);
+  return [a, b];
+}
+
+function nthOk(a: number, b: number, pos: number): boolean {
+  if (a === 0) return pos === b;
+  if (a > 0) return pos >= b && (pos - b) % a === 0;
+  return pos <= b && (b - pos) % -a === 0;
+}
+
+const splitWs = (s: string): string[] => s.split(/[\t\n\f\r ]+/).filter((x) => x !== "");
+
+/**
+ * Per-query caches: element-sibling positions per parent, match results per
+ * (step, node) and the first sibling matching a step (for "~"). They keep
+ * matching linear in the number of siblings and in the tree depth; results are
+ * unchanged.
+ */
+class Ctx {
+  private readonly sibs = new Map<HtmlNode, HtmlNode[]>();
+  private readonly pos = new Map<HtmlNode, number>();
+  readonly memo = new Map<string, Map<HtmlNode, boolean>>();
+  readonly first = new Map<string, Map<HtmlNode, number>>();
+
+  siblings(el: HtmlNode): [HtmlNode[], number] {
+    const p = el.parent;
+    if (p === null) return [[el], 0];
+    let sib = this.sibs.get(p);
+    if (sib === undefined) {
+      sib = el.elementSiblings();
+      sib.forEach((x, i) => this.pos.set(x, i));
+      this.sibs.set(p, sib);
+    }
+    return [sib, this.pos.get(el)!];
+  }
+}
+
+function table<K, V>(m: Map<string, Map<K, V>>, key: string): Map<K, V> {
+  let t = m.get(key);
+  if (t === undefined) {
+    t = new Map();
+    m.set(key, t);
+  }
+  return t;
+}
+
+function matchCompound(el: HtmlNode, comp: Compound, ctx: Ctx): boolean {
+  if (comp.tag !== null && comp.tag !== "*" && el.name !== comp.tag) return false;
+  for (const s of comp.simple) {
+    switch (s.k) {
+      case "id":
+        if (el.attr("id") !== s.v) return false;
+        break;
+      case "class":
+        if (!splitWs(el.attr("class") ?? "").includes(s.v)) return false;
+        break;
+      case "attr": {
+        const v = el.attr(s.name);
+        if (v === null) return false;
+        const val = s.v;
+        if (s.op === "=" && v !== val) return false;
+        if (s.op === "~=" && !splitWs(v).includes(val)) return false;
+        if (s.op === "|=" && !(v === val || v.startsWith(val + "-"))) return false;
+        if (s.op === "^=" && !(val !== "" && v.startsWith(val))) return false;
+        if (s.op === "$=" && !(val !== "" && v.endsWith(val))) return false;
+        if (s.op === "*=" && !(val !== "" && v.includes(val))) return false;
+        break;
+      }
+      case "empty":
+        if (el.children.some((c) => c.kind === "element" || c.kind === "text")) return false;
+        break;
+      case "not":
+        if (matchCompound(el, s.inner, ctx)) return false;
+        break;
+      default: {
+        const [sib, idx] = ctx.siblings(el);
+        const pos = idx + 1;
+        if (s.k === "first-child" && pos !== 1) return false;
+        if (s.k === "last-child" && pos !== sib.length) return false;
+        if (s.k === "only-child" && sib.length !== 1) return false;
+        if (s.k === "nth-child" && !nthOk(s.a, s.b, pos)) return false;
+        if (s.k === "nth-last-child" && !nthOk(s.a, s.b, sib.length - pos + 1)) return false;
+      }
+    }
+  }
+  return true;
+}
+
+function matchComplex(el: HtmlNode, parts: Complex, k: number, ctx: Ctx, which: number): boolean {
+  const memo = table(ctx.memo, `${which}:${k}`);
+  let hit = memo.get(el);
+  if (hit === undefined) {
+    hit = matchStep(el, parts, k, ctx, which);
+    memo.set(el, hit);
+  }
+  return hit;
+}
+
+function matchStep(el: HtmlNode, parts: Complex, k: number, ctx: Ctx, which: number): boolean {
+  const [comb, comp] = parts[k];
+  if (!matchCompound(el, comp, ctx)) return false;
+  if (k === 0) return true;
+  if (comb === ">") {
+    const p = el.parent;
+    return p !== null && p.kind === "element" && matchComplex(p, parts, k - 1, ctx, which);
+  }
+  if (comb === " ") {
+    for (let p = el.parent; p !== null && p.kind === "element"; p = p.parent) {
+      if (matchComplex(p, parts, k - 1, ctx, which)) return true;
+    }
+    return false;
+  }
+  const [sib, idx] = ctx.siblings(el);
+  if (comb === "+") return idx > 0 && matchComplex(sib[idx - 1], parts, k - 1, ctx, which);
+  // "~": some earlier sibling matches step k-1; remember the first such sibling per parent.
+  const firsts = table(ctx.first, `${which}:${k}`);
+  const p = el.parent!;
+  let first = firsts.get(p);
+  if (first === undefined) {
+    first = sib.findIndex((x) => matchComplex(x, parts, k - 1, ctx, which));
+    if (first < 0) first = sib.length;
+    firsts.set(p, first);
+  }
+  return first < idx;
+}
+
+/** A parsed selector list (SPEC section 8). */
+export class Selector {
+  private constructor(private readonly list: Complex[]) {}
+
+  /** Parses `selector`; throws {@link SelectorError}. */
+  static parse(selector: string): Selector {
+    return new Selector(new SelParser(selector).list());
+  }
+
+  /** True when `el` is an element that matches. */
+  matches(el: HtmlNode): boolean {
+    return this.matchesIn(el, new Ctx());
+  }
+
+  /** @internal */
+  matchesIn(el: HtmlNode, ctx: Ctx): boolean {
+    return el.kind === "element" && this.list.some((parts, i) => matchComplex(el, parts, parts.length - 1, ctx, i));
+  }
+}
+
+// ---------------------------------------------------------------- meta and tables
+
+/** Metadata found in a document (SPEC section 9). */
+export interface PageMeta {
+  title: string | null;
+  description: string | null;
+  canonical: string | null;
+  lang: string | null;
+  og: [string, string][];
+}
+
+const collapse = (s: string): string => s.replace(/[\t\n\f\r ]+/g, " ").replace(/^ +| +$/g, "");
+
+function extractMeta(doc: HtmlNode): PageMeta {
+  const out: PageMeta = { title: null, description: null, canonical: null, lang: null, og: [] };
+  let seenTitle = false;
+  for (const el of doc.elements()) {
+    if (el.name === "title" && !seenTitle) {
+      seenTitle = true;
+      const t = collapse(
+        el.children
+          .filter((c) => c.kind === "text")
+          .map((c) => c.data)
+          .join(""),
+      );
+      out.title = t === "" ? null : t;
+    } else if (el.name === "html") {
+      if (out.lang === null) out.lang = el.attr("lang");
+    } else if (el.name === "meta") {
+      const content = el.attr("content");
+      if (content === null) continue;
+      if (asciiLower(el.attr("name") ?? "") === "description" && out.description === null) out.description = content;
+      const prop = el.attr("property") ?? "";
+      if (asciiLower(prop).startsWith("og:")) out.og.push([prop.slice(3), content]);
+    } else if (el.name === "link" && out.canonical === null) {
+      if (splitWs(asciiLower(el.attr("rel") ?? "")).includes("canonical")) out.canonical = el.attr("href");
+    }
+  }
   return out;
 }
 
-// ───────────────────────────── meta ─────────────────────────────
-
-export interface PageMeta { title: string | null; description: string | null; ogTags: Array<[string, string]> }
-export function extractMeta(doc: Node): PageMeta {
-  const m: PageMeta = { title: null, description: null, ogTags: [] };
-  const t = doc.findFirst("title");
-  if (t) { let text = ""; for (const c of t.children) if (c.text !== null) text += c.text; if (text !== "") m.title = text; }
-  for (const el of doc.findAll("meta")) {
-    const name = el.attr("name");
-    if (name !== undefined && asciiLower(name) === "description") { const c = el.attr("content"); if (c !== undefined) m.description = c; }
-    const prop = el.attr("property");
-    if (prop !== undefined && prop.startsWith("og:")) { const c = el.attr("content"); if (c !== undefined) m.ogTags.push([prop.slice(3), c]); }
-  }
-  return m;
+function parseSpan(v: string | null, dflt: number, maximum: number): number {
+  if (v === null) return dflt;
+  const m = /^[\t\n\f\r ]*\+?([0-9]+)/.exec(v);
+  if (m === null) return dflt;
+  const n = m[1].length <= 9 ? parseInt(m[1], 10) : maximum;
+  if (n === 0) return dflt;
+  return Math.min(n, maximum);
 }
 
-// ───────────────────────────── tables ─────────────────────────────
+/** Most cells produced for one table; extraction stops there. */
+export const MAX_CELLS = 1_000_000;
 
-export type Row = string[];
-export type Table = Row[];
-const MAX_COLSPAN = 1000, MAX_ROWSPAN = 65534, MAX_CELLS = 1_000_000;
-function cellText(cell: Node): string {
-  const parts: string[] = [];
-  const collect = (n: Node) => { if (n.text !== null) parts.push(n.text, " "); for (const c of n.children) collect(c); };
-  for (const c of cell.children) collect(c);
-  return splitWhitespace(parts.join("")).join(" ");
-}
-function span(cell: Node, attr: string, max: number): number {
-  const v = cell.attr(attr);
-  if (v === undefined) return 1;
-  const t = rustTrim(v);
-  if (!/^\+?[0-9]+$/.test(t)) return 1;             // Rust usize::parse accepts a leading '+'
-  const n = BigInt(t);                              // usize::parse fails above u64::MAX -> default 1
-  if (n > 18446744073709551615n || n === 0n) return 1;
-  return n > BigInt(max) ? max : Number(n);
-}
-function collectRows(n: Node, rows: Node[]): void {
-  for (const c of n.children) {
-    if (c.isElement("table")) continue;
-    if (c.isElement("tr")) rows.push(c); else collectRows(c, rows);
-  }
-}
-export function extractTables(doc: Node): Table[] { return doc.findAll("table").map(extractOne); }
-function extractOne(table: Node): Table {
-  const trs: Node[] = []; collectRows(table, trs);
-  const grid: Table = [];
-  const pending: Array<[number, string] | null> = [];
-  let total = 0;
-  for (const tr of trs) {
-    const row: Row = []; let col = 0;
-    const fill = () => {
-      for (;;) {
-        const p = pending[col];
-        if (!p) break;
-        row.push(p[1]); p[0]--;
-        if (p[0] === 0) pending[col] = null;
-        col++;
+function extractTables(doc: HtmlNode): string[][][] {
+  const tables: string[][][] = [];
+  for (const table of doc.elements()) {
+    if (table.name !== "table") continue;
+    const rows: HtmlNode[] = [];
+    const collect = (n: HtmlNode): void => {
+      for (const c of n.children) {
+        if (c.kind !== "element" || c.name === "table") continue;
+        if (c.name === "tr") rows.push(c);
+        else collect(c);
       }
     };
-    for (const cell of tr.children.filter((c) => c.isElement("td") || c.isElement("th"))) {
-      fill();
-      const text = cellText(cell), cs = span(cell, "colspan", MAX_COLSPAN), rs = span(cell, "rowspan", MAX_ROWSPAN);
-      for (let k = 0; k < cs; k++) {
-        if (++total > MAX_CELLS) return grid;
-        row.push(text);
-        if (rs > 1) { while (pending.length <= col) pending.push(null); pending[col] = [rs - 1, text]; }
-        col++;
+    collect(table);
+    const grid: string[][] = [];
+    let pending = new Map<number, [number, string]>();
+    let total = 0;
+    let stop = false;
+    for (const tr of rows) {
+      const row = new Map<number, string>();
+      const next = new Map<number, [number, string]>();
+      for (const [col, [left, text]] of pending) {
+        row.set(col, text);
+        if (left > 1) next.set(col, [left - 1, text]);
       }
+      let col = 0;
+      for (const cell of tr.children) {
+        if (!(cell.is("td") || cell.is("th"))) continue;
+        const text = collapse(cell.textContent());
+        const cs = parseSpan(cell.attr("colspan"), 1, 1000);
+        const rs = parseSpan(cell.attr("rowspan"), 1, 65534);
+        for (let x = 0; x < cs; x++) {
+          while (row.has(col)) col++;
+          total++;
+          if (total > MAX_CELLS) {
+            stop = true;
+            break;
+          }
+          row.set(col, text);
+          if (rs > 1) next.set(col, [rs - 1, text]);
+          col++;
+        }
+        if (stop) break;
+      }
+      pending = next;
+      let width = 0;
+      for (const c of row.keys()) width = Math.max(width, c + 1);
+      const line: string[] = [];
+      for (let c = 0; c < width; c++) line.push(row.get(c) ?? "");
+      grid.push(line);
+      if (stop) break;
     }
-    fill();
-    while (col < pending.length && pending[col]) fill();
-    grid.push(row);
+    tables.push(grid);
   }
-  return grid;
+  return tables;
 }
